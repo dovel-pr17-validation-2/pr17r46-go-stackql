@@ -1,0 +1,114 @@
+package astindirect
+
+import (
+	"fmt"
+
+	"github.com/stackql/stackql/internal/stackql/drm"
+	"github.com/stackql/stackql/internal/stackql/sql_system"
+	"github.com/stackql/stackql/internal/stackql/symtab"
+	"github.com/stackql/stackql/internal/stackql/typing"
+
+	"github.com/stackql/stackql-parser/go/vt/sqlparser"
+	"github.com/stackql/stackql/internal/stackql/internal_data_transfer/internaldto"
+)
+
+var (
+	_ Indirect = &View{}
+	_ Indirect = &Subquery{}
+	_ Indirect = &MaterializedView{}
+)
+
+type IndirectType int
+
+const (
+	ViewType IndirectType = iota
+	SubqueryType
+	CTEType
+	MaterializedViewType
+	PhysicalTableType
+	SelectType
+	ExecType
+	InsertRowsType
+)
+
+func NewViewIndirect(viewDTO internaldto.RelationDTO) (Indirect, error) {
+	rv := &View{
+		viewDTO:               viewDTO,
+		underlyingSymbolTable: symtab.NewHashMapTreeSymTab(),
+	}
+	return rv, nil
+}
+
+func NewMaterializedViewIndirect(viewDTO internaldto.RelationDTO, sqlSystem sql_system.SQLSystem) (Indirect, error) {
+	rv := &MaterializedView{
+		viewDTO:               viewDTO,
+		underlyingSymbolTable: symtab.NewHashMapTreeSymTab(),
+		sqlSystem:             sqlSystem,
+	}
+	return rv, nil
+}
+
+func NewParserSelectIndirect(selectObj *sqlparser.Select, selCtx drm.PreparedStatementCtx) (Indirect, error) {
+	rv := &parserSelectionIndirect{
+		selCtx:                selCtx,
+		selectObj:             selectObj,
+		underlyingSymbolTable: symtab.NewHashMapTreeSymTab(),
+	}
+	return rv, nil
+}
+
+func NewInsertRowsIndirect(insertObj *sqlparser.Insert, selCtx drm.PreparedStatementCtx) (Indirect, error) {
+	rv := &parserSelectionIndirect{
+		selCtx:                selCtx,
+		insertObj:             insertObj,
+		underlyingSymbolTable: symtab.NewHashMapTreeSymTab(),
+	}
+	return rv, nil
+}
+
+func NewPhysicalTableIndirect(tableDTO internaldto.RelationDTO, sqlSystem sql_system.SQLSystem) (Indirect, error) {
+	rv := &physicalTable{
+		tableDTO:              tableDTO,
+		underlyingSymbolTable: symtab.NewHashMapTreeSymTab(),
+		sqlSystem:             sqlSystem,
+	}
+	return rv, nil
+}
+
+func NewSubqueryIndirect(subQueryDTO internaldto.SubqueryDTO) (Indirect, error) {
+	if subQueryDTO == nil {
+		return nil, fmt.Errorf("cannot accomodate nil subquery")
+	}
+	rv := &Subquery{
+		subQueryDTO:           subQueryDTO,
+		subQuery:              subQueryDTO.GetSubquery(),
+		selectStmt:            subQueryDTO.GetSubquery().Select,
+		underlyingSymbolTable: symtab.NewHashMapTreeSymTab(),
+	}
+	return rv, nil
+}
+
+type Indirect interface {
+	Parse() error
+
+	GetColumnByName(name string) (typing.ColumnMetadata, bool)
+	GetRelationalColumnByIdentifier(name string) (typing.RelationalColumn, bool)
+	GetColumns() []typing.ColumnMetadata
+	GetRelationalColumns() []typing.RelationalColumn
+	GetName() string
+
+	GetSelectAST() sqlparser.SelectStatement
+	GetSelectContext() drm.PreparedStatementCtx
+	GetType() IndirectType
+	GetUnderlyingSymTab() symtab.SymTab
+
+	SetSelectContext(drm.PreparedStatementCtx)
+	SetUnderlyingSymTab(symtab.SymTab)
+	GetTranslatedDDL() (string, bool)
+	GetLoadDML() (string, bool)
+	Next() (Indirect, bool)
+	WithNext(Indirect) Indirect
+	MatchOnParams(map[string]any) (Indirect, bool)
+	SetElide(bool)
+	IsElide() bool
+}

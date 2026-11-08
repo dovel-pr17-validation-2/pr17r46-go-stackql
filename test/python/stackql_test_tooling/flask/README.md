@@ -1,0 +1,213 @@
+
+
+# HTTP(S) servers for simulated integration / regression testing
+
+## Flask
+
+We have now migrated entirely to [flask](https://flask.palletsprojects.com/en/stable/), from the prior java [mockserver](https://www.mock-server.com/).  There is no disparaging of mockserver whatsoever; rather this was motivated in large part by different behaviour against versions of `java` / dependency libraries, also by the community support and knowledge base for `flask` and `jinja`.  That said, the mock defninitions to some degree are a holdover from `mockserver`; this should diminish over time.
+
+One pertinent fact in life with `flask` is that processes die hard; so it generally pays this before testing mocks:
+
+```bash
+pgrep -f flask | xargs kill -9
+```
+
+### Running in docker
+
+This is far and away the easiest option, given you have docker on your system.  You must let the sequence run before starting any `stackql` client, or the TLS credentials will be overwritten.  Then:
+
+```bash
+
+docker compose -f docker-compose-testing.yml up -d --build --force-recreate
+
+```
+
+To kill all:
+
+```bash
+
+docker compose -f docker-compose-testing.yml down --volumes
+
+```
+
+### To Run Natively
+
+In order to get the environmental variables required, you can go to the repository root and then `source cicd/scripts/context.sh`, or set manually; hopefully self-explanatory.
+
+GCP mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/gcp/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port  1080
+```
+
+Azure mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/azure/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port 1095
+```
+
+Okta mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/okta/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0  --port 1090
+```
+
+AWS mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/aws/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0  --port 1091
+```
+
+Github mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/github/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port 1093
+```
+
+Sumologic mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/sumologic/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port 1096
+```
+
+Digitalocean mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/digitalocean/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port 1097
+```
+
+`googleadmin` mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/googleadmin/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port 1098
+```
+
+`k8s` mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/k8s/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port 1092
+```
+
+stackql auth testing mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/static_auth/app run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port  1170
+```
+
+Token server mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/oauth2/token_srv run --cert=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_cert.pem --key=${REPOSITORY_ROOT}/test/server/mtls/credentials/pg_server_key.pem --host 0.0.0.0 --port  2091
+```
+
+Registry mocks:
+
+```bash
+flask --app=${REPOSITORY_ROOT}/test/python/stackql_test_tooling/flask/registry/app run --host 0.0.0.0 --port 1094
+```
+
+
+### Manually testing mocks
+
+With embedded `sqlite` (default), from the root of this repository:
+
+```bash
+source cicd/scripts/testing-env.sh
+
+stackql --registry="${stackqlMockedRegistryStr}" --auth="${stackqlAuthStr}" --tls.allowInsecure shell
+```
+
+With `postgres`, from the root of this repository:
+
+```bash
+docker compose -f docker-compose-externals.yml up postgres_stackql -d
+
+source cicd/scripts/testing-env.sh
+
+stackql --registry="${stackqlMockedRegistryStr}" --tls.allowInsecure --sqlBackend="{ \"dbEngine\": \"postgres_tcp\", \"sqlDialect\": \"postgres\", \"dsn\": \"postgres://stackql:stackql@127.0.0.1:7432/stackql\" }" shell
+```
+
+## Sources of Mock Data
+
+There are some decent examples in vendor documentation, eg:
+
+- [Azure vendor documenation](https://learn.microsoft.com/en-us/rest/api/azure/).
+
+## Preparing mock registry entries
+
+From within the dir where your file lives:
+
+```bash
+
+COPYFILE_DISABLE=1 tar -czvf <name>.tgz <source dir>
+
+# eg: COPYFILE_DISABLE=1 tar -cvzf google-v0.2.1.tgz v0.2.1
+
+```
+
+## The `omnisdk` mock and the streaming robot test
+
+`omnisdk/` is a vendored copy of the flask mock bundled with the
+`github.com/stackql-labs/omnisdk` module, whose version `go.mod` pins. It is
+vendored rather than resolved from the Go module cache because the `dockertest`
+and `wsltest` CI jobs download prebuilt binaries and have no Go toolchain.
+
+Re-vendor it whenever that pin moves, and regenerate
+`test/assets/expected/preview/omni-storage-buckets.jsonl` from the module's own
+`test/mock/expected/omni-blob-org.jsonl` so the expectation stays upstream:
+
+```bash
+D="$(go list -m -f '{{.Dir}}' github.com/stackql-labs/omnisdk)"
+cp -R "${D}/test/mock/app.py" "${D}/test/mock/templates" "${D}/test/mock/collateral" \
+  test/python/stackql_test_tooling/flask/omnisdk/
+```
+
+The copy carries two local additions, both defaulting to the upstream
+behaviour, which must be re-applied after any re-vendor.
+
+It serves the AWS, Azure and GCP legs the `stackql_preview.audit.*` relations
+call, and honours one local addition: `OMNISDK_MOCK_DELAY_MS` delays each
+per-bucket request, so a test can observe rows being emitted while the upstream
+is still producing. It defaults to zero, and is set to `50` where the mock is
+started (`docker-compose-testing.yml` and `web_service_keywords.py`).
+
+To run the streaming test on its own:
+
+```bash
+PYTHONPATH="${PWD}/test/python" robot \
+  --variable EXECUTION_PLATFORM:native \
+  --variable SQL_BACKEND:sqlite_embedded \
+  --test "Preview Rows Are Emitted Throughout The Run" \
+  test/robot/functional
+```
+
+Every `stackql_preview` scenario, including the multi-cloud row set:
+
+```bash
+PYTHONPATH="${PWD}/test/python" robot \
+  --variable EXECUTION_PLATFORM:native \
+  --variable SQL_BACKEND:sqlite_embedded \
+  --test "Preview*" \
+  test/robot/functional
+```
+
+The streaming test asserts that stdout grows at several distinct times rather
+than in one write at the end. The backend is configured by the `--preview` CLI argument, not by environment
+variables: `{"batchSize":10,"flushInterval":"50ms","endpoint":...}`. `batchSize`
+(default 100) caps how many rows a read gathers, `flushInterval` (default
+`50ms`) bounds how long a read waits, so a result smaller than the batch still
+streams. `endpoint` takes either a base URL for every service or an object of
+service to override, exactly as omnisdk does.
+
+To drive the mock by hand:
+
+```bash
+cd test/python/stackql_test_tooling/flask/omnisdk
+OMNISDK_MOCK_DELAY_MS=50 PORT=8085 python3 app.py
+
+# then, in another shell
+export AWS_ACCESS_KEY_ID=AK AWS_SECRET_ACCESS_KEY=SK
+./build/stackql exec -o=jsonl \
+  --preview='{"batchSize":1,"flushInterval":"50ms","endpoint":{"aws.s3":{"scheme":"http","host":"127.0.0.1","port":"8085"}}}' \
+  "select * from stackql_preview.audit.aws_s3_buckets where region = 'us-east-1' and method = 'list';"
+```

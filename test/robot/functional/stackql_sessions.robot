@@ -1,0 +1,593 @@
+*** Settings ***
+Resource          ${CURDIR}/stackql.resource
+
+*** Test Cases *** 
+Shell Session Simple
+    Pass Execution If    "${IS_WINDOWS}" == "1"    Skipping session test in windows
+    Should StackQL Shell Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${SHELL_SESSION_SIMPLE_COMMANDS}
+    ...    ${SHELL_SESSION_SIMPLE_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/Shell-Session-Simple.tmp
+    [Teardown]    Stackql Per Test Teardown
+
+Shell Session Azure Compute Table Nomenclature Mutation Guard
+    Pass Execution If    "${IS_WINDOWS}" == "1"    Skipping session test in windows
+    Should StackQL Shell Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${SHELL_COMMANDS_AZURE_COMPUTE_MUTATION_GUARD}
+    ...    ${SHELL_COMMANDS_AZURE_COMPUTE_MUTATION_GUARD_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/Shell-Session-Azure-Compute-Table-Nomenclature-Mutation-Guard.tmp
+    [Teardown]    Stackql Per Test Teardown
+
+Shell Session Multiple Statements Inline
+    Pass Execution If    "${IS_WINDOWS}" == "1"    Skipping session test in windows
+    Should StackQL Shell Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${SHELL_SESSION_MULTI_STMT_INLINE_COMMANDS}
+    ...    dummyapp.io
+    ...    stdout=${CURDIR}/tmp/Shell-Session-Multiple-Statements-Inline.tmp
+    # Verify readline history preserves trailing semicolons
+    Pass Execution If    "${EXECUTION_PLATFORM}" == "docker"    Skipping readline verification in docker
+    ${readline_content} =    Get File    ${REPOSITORY_ROOT}${/}test${/}.stackql${/}readline${/}readline.tmp
+    Should Contain    ${readline_content}    stackql_repositories;
+    Should Contain    ${readline_content}    order by name desc;
+    [Teardown]    Stackql Per Test Teardown
+
+Shell Session Multi Line Then Multi Statement
+    Pass Execution If    "${IS_WINDOWS}" == "1"    Skipping session test in windows
+    Should StackQL Shell Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${SHELL_SESSION_MULTI_LINE_THEN_MULTI_STMT_COMMANDS}
+    ...    dummyapp.io
+    ...    stdout=${CURDIR}/tmp/Shell-Session-Multi-Line-Then-Multi-Statement.tmp
+    [Teardown]    Stackql Per Test Teardown
+
+Shell Session Multi Line Semicolon Terminated
+    Pass Execution If    "${IS_WINDOWS}" == "1"    Skipping session test in windows
+    Should StackQL Shell Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${SHELL_SESSION_MULTI_LINE_SEMICOLON_TERMINATED_COMMANDS}
+    ...    ${SHELL_SESSION_MULTI_LINE_SEMICOLON_TERMINATED_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/Shell-Session-Multi-Line-Semicolon-Terminated.tmp
+    [Teardown]    Stackql Per Test Teardown
+
+Shell Session Invalid Registry Config Exits Cleanly
+    Pass Execution If    "${IS_WINDOWS}" == "1"    Skipping session test in windows
+    Pass Execution If    "${EXECUTION_PLATFORM}" == "docker"    Skipping readline verification in docker
+    ${input} =    Catenate
+    ...    "${STACKQL_EXE}" shell "--registry=/not/valid/yaml/registry/config" "--tls.allowInsecure=true" "--approot=test/.stackql" "--execution.concurrency.limit=${CONCURRENCY_LIMIT}"
+    ${result} =    Run Process
+    ...    sh     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/Shell-Session-Invalid-Registry-Config-Exits-Cleanly.tmp
+    ...    stderr=${CURDIR}/tmp/Shell-Session-Invalid-Registry-Config-Exits-Cleanly-stderr.tmp
+    Should Be Equal As Integers    ${result.rc}        1
+    Should Contain                 ${result.stderr}    cannot unmarshal
+    Should Not Contain             ${result.stderr}    panic
+    [Teardown]    NONE
+
+PG Session GC Manual Behaviour Canonical
+    [Tags]    shard-group:pg-server-generation
+    Should PG Client Session Inline Equal Strict
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${SHELL_COMMANDS_GC_SEQUENCE_CANONICAL}
+    ...    ${SHELL_COMMANDS_GC_SEQUENCE_CANONICAL_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-GC-Manual-Behaviour-Canonical.tmp
+    [Teardown]    NONE
+
+PG Session GC Eager Behaviour Canonical
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX_WITH_EAGER_GC}
+    ...    ${SHELL_COMMANDS_GC_SEQUENCE_EAGER}
+    ...    ${SHELL_COMMANDS_GC_SEQUENCE_EAGER_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-GC-Eager-Behaviour-Canonical.tmp
+    [Teardown]    NONE
+
+PG Session View Handling Behaviour Canonical
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX_WITH_EAGER_GC}
+    ...    ${SHELL_COMMANDS_VIEW_HANDLING_SEQUENCE}
+    ...    ${SHELL_COMMANDS_VIEW_HANDLING_SEQUENCE_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-View-Handling-Behaviour-Canonical.tmp
+    [Teardown]    NONE
+
+PG Session View Handling With Replacement Behaviour Canonical
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX_WITH_EAGER_GC}
+    ...    ${SHELL_COMMANDS_VIEW_HANDLING_WITH_REPLACEMENT_SEQUENCE}
+    ...    ${SHELL_COMMANDS_VIEW_HANDLING_WITH_REPLACEMENT_SEQUENCE_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-View-Handling-With-Replacement-Behaviour-Canonical.tmp
+    [Teardown]    NONE
+
+PG Session Aliased Cross Cloud Disks View Handling Behaviour Canonical
+    Pass Execution If    "${SQL_BACKEND}" == "postgres_tcp"    TODO: FIX THIS... Skipping postgres backend test due to split_part function
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX_WITH_EAGER_GC}
+    ...    ${SHELL_COMMANDS_DISKS_VIEW_ALIASED_SEQUENCE}
+    ...    ${SHELL_COMMANDS_DISKS_VIEW_ALIASED_SEQUENCE_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Aliased-Cross-Cloud-Disks-View-Handling-Behaviour-Canonical.tmp
+    [Teardown]    NONE
+
+PG Session NOT Aliased Cross Cloud Disks View Handling Behaviour Canonical
+    Pass Execution If    "${SQL_BACKEND}" == "postgres_tcp"    TODO: FIX THIS... Skipping postgres backend test due to split_part function
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX_WITH_EAGER_GC}
+    ...    ${SHELL_COMMANDS_DISKS_VIEW_NOT_ALIASED_SEQUENCE}
+    ...    ${SHELL_COMMANDS_DISKS_VIEW_NOT_ALIASED_SEQUENCE_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-NOT-Aliased-Cross-Cloud-Disks-View-Handling-Behaviour-Canonical.tmp
+    [Teardown]    NONE
+
+PG Session Azure Compute Table Nomenclature Mutation Guard
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${SHELL_COMMANDS_AZURE_COMPUTE_MUTATION_GUARD}
+    ...    ${SHELL_COMMANDS_AZURE_COMPUTE_MUTATION_GUARD_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Azure-Compute-Table-Nomenclature-Mutation-Guard.tmp
+    [Teardown]    NONE
+
+PG Session Materialized View Lifecycle
+    ${inputStr} =    Catenate
+    ...    [
+    ...    "create materialized view vw_aws_usr as select Arn, UserName, UserId, region from aws.iam.users where region = 'us-east-1';",
+    ...    "select u1.UserName, u2.UserId, u2.Arn, u1.region from aws.iam.users u1 inner join vw_aws_usr u2 on u1.Arn = u2.Arn where u1.region = 'us-east-1' and u2.region = 'us-east-1' order by u1.UserName desc;",
+    ...    "drop materialized view vw_aws_usr;"
+    ...    ]
+    ${inputList} =    Evaluate    ${inputStr}
+    ${outputStr} =    Catenate
+    ...    [
+    ...    { "UserName":  "Jackie", "UserId": "AIDIODR4TAW7CSEXAMPLE", "Arn": "arn:aws:iam::123456789012:user/division_abc/subdivision_xyz/engineering/Jackie", "region": "us-east-1" },
+    ...    { "UserName":  "Andrew", "UserId": "AID2MAB8DPLSRHEXAMPLE", "Arn": "arn:aws:iam::123456789012:user/division_abc/subdivision_xyz/engineering/Andrew", "region": "us-east-1" }
+    ...    ]
+    ${outputList} =    Evaluate    ${outputStr}
+    Should PG Client Session Inline Equal
+    ...    ${POSTGRES_URL_UNENCRYPTED_CONN}
+    ...    ${inputList}
+    ...    ${outputList}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Materialized-View-Lifecycle.tmp
+    ...    stderr=${CURDIR}/tmp/PG-Session-Materialized-View-Lifecycle-stderr.tmp
+    [Teardown]    NONE
+
+PG Session V2 Materialized View Lifecycle
+    ${inputStr} =    Catenate
+    ...    [
+    ...    "create materialized view vw_aws_usr as select Arn, UserName, UserId, region from aws.iam.users where region = 'us-east-1';",
+    ...    "select u1.UserName, u2.UserId, u2.Arn, u1.region from aws.iam.users u1 inner join vw_aws_usr u2 on u1.Arn = u2.Arn where u1.region = 'us-east-1' and u2.region = 'us-east-1' order by u1.UserName desc;",
+    ...    "drop materialized view vw_aws_usr;"
+    ...    ]
+    ${inputList} =    Evaluate    ${inputStr}
+    ${outputStr} =    Catenate
+    ...    [
+    ...    { "UserName":  "Jackie", "UserId": "AIDIODR4TAW7CSEXAMPLE", "Arn": "arn:aws:iam::123456789012:user/division_abc/subdivision_xyz/engineering/Jackie", "region": "us-east-1" },
+    ...    { "UserName":  "Andrew", "UserId": "AID2MAB8DPLSRHEXAMPLE", "Arn": "arn:aws:iam::123456789012:user/division_abc/subdivision_xyz/engineering/Andrew", "region": "us-east-1" }
+    ...    ]
+    ${outputList} =    Evaluate    ${outputStr}
+    Should PG Client V2 Session Inline Equal
+    ...    ${POSTGRES_URL_UNENCRYPTED_CONN}
+    ...    ${inputList}
+    ...    ${outputList}
+    ...    stdout=${CURDIR}/tmp/PG-Session-v2-Materialized-View-Lifecycle.tmp
+    ...    stderr=${CURDIR}/tmp/PG-Session-v2-Materialized-View-Lifecycle-stderr.tmp
+    [Teardown]    NONE
+
+PG Session Wrongly Named Column error recovery Azure Compute Table Nomenclature
+    Should PG Client Session Inline Contain
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${SHELL_SESSION_SIMPLE_COMMANDS_AFTER_ERROR}
+    ...    ${SHELL_SESSION_SIMPLE_COMMANDS_AFTER_ERROR_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Wrongly-Named-Column-error-recovery-Azure-Compute-Table-Nomenclature.tmp
+    [Teardown]    NONE
+
+Shell Session Azure Billing Path Interrogation Regression Guard
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${SHELL_COMMANDS_AZURE_BILLING_PATH_SPLIT_GUARD}
+    ...    ${SHELL_COMMANDS_AZURE_BILLING_PATH_SPLIT_GUARD_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Azure-Compute-Table-Nomenclature-Mutation-Guard.tmp
+    [Teardown]    NONE
+
+PG Session Anayltics Cache Behaviour Canonical
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX_WITH_NAMESPACES}
+    ...    ${SHELL_COMMANDS_SPECIALCASE_REPEATED_CACHED}
+    ...    ${SHELL_COMMANDS_SPECIALCASE_REPEATED_CACHED_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Anayltics-Cache-Behaviour-Canonical.tmp
+    [Teardown]    NONE
+
+PG Session Postgres Client Setup Queries
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${PG_CLIENT_SETUP_QUERIES}
+    ...    ${PG_CLIENT_SETUP_QUERIES_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Postgres-Client-Setup-Queries.tmp
+    [Teardown]    NONE
+
+PG Session Postgres Client V2 Setup Queries
+    Should PG Client V2 Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${PG_CLIENT_SETUP_QUERIES}
+    ...    ${PG_CLIENT_SETUP_QUERIES_JSON_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Postgres-Client-V2-Setup-Queries.tmp
+    [Teardown]    NONE
+
+PG Session Postgres Client AWS Method Signature Polymorphism
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${AWS_CLOUD_CONTROL_METHOD_SIGNATURE_CMD_ARR}
+    ...    ${AWS_CLOUD_CONTROL_METHOD_SIGNATURE_CMD_ARR_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Postgres-Client-AWS-Method-Signature-Polymorphism.tmp
+    [Teardown]    NONE
+
+PG Session Postgres Client Typed Queries
+    Pass Execution If    "${SQL_BACKEND}" == "postgres_tcp"    TODO: FIX THIS... Skipping postgres backend test likely due to typing issues
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${SELECT_AWS_CLOUD_CONTROL_EVENTS_MINIMAL}
+    ...    ${SELECT_AWS_CLOUD_CONTROL_EVENTS_MINIMAL_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Postgres-Client-Typed-Queries.tmp
+    [Teardown]    NONE
+
+PG Session Server Survives Defective Query
+    Should PG Client Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${AWS_CLOUD_CONTROL_BUCKET_DETAIL_PROJECTION_DEFECTIVE_CMD_ARR}
+    ...    ${AWS_CLOUD_CONTROL_BUCKET_DETAIL_PROJECTION_DEFECTIVE_CMD_ARR_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Server-Survives-Defective-Query-and-Subsequently-Serves-Valid-Query.tmp
+    [Teardown]    NONE
+
+PG Session Extended Query Bound Params Stay Data
+    [Documentation]    Bound parameters are data, never SQL: the string NULL is not SQL NULL,
+    ...                a trailing backslash cannot swallow the closing quote, and a
+    ...                placeholder inside a string literal is not substituted.
+    ${params} =    Evaluate    ('NULL', 'x' + chr(92), 'y')
+    ${expected} =    Evaluate    [{'a': 'text', 'b': 'ne', 'c': 'y', 'd': '$1'}]
+    Should PG Client Bound Query Results Equal
+    ...    ${PSQL_UNENCRYPTED_CONN_STR}
+    ...    SELECT CASE WHEN %s \= 'NULL' THEN 'text' ELSE 'null' END AS a, CASE WHEN %s \= 'never' THEN 'eq' ELSE 'ne' END AS b, %s AS c, '$1' AS d
+    ...    ${params}
+    ...    ${expected}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Extended-Query-Bound-Params-Stay-Data.tmp
+    [Teardown]    NONE
+
+PG Session Postgres Client V2 Typed Queries
+    Pass Execution If    "${SQL_BACKEND}" == "postgres_tcp"     TODO: FIX THIS... Skipping postgres backend test likely due to typing issues
+    Should PG Client V2 Session Inline Equal
+    ...    ${PSQL_MTLS_CONN_STR_UNIX}
+    ...    ${SELECT_AWS_CLOUD_CONTROL_EVENTS_MINIMAL}
+    ...    ${SELECT_AWS_CLOUD_CONTROL_EVENTS_MINIMAL_EXPECTED}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Postgres-Client-V2-Typed-Queries.tmp
+    [Teardown]    NONE
+
+
+
+High Volume IN Query Is Correct and Performs OK
+    Pass Execution If    "${CONCURRENCY_LIMIT}" == "1"    We only expect performance when concurrency settings are aggressive.
+    ${inputStr} =    Catenate
+    ...              select 
+    ...              instanceId, 
+    ...              ipAddress 
+    ...              from aws.ec2.instances 
+    ...              where 
+    ...              instanceId not in ('some-silly-id')  
+    ...              and region in (
+    ...              'us-east-1',
+    ...              'us-east-2',
+    ...              'us-west-1',
+    ...              'us-west-2',
+    ...              'ap-south-1',
+    ...              'ap-northeast-3',
+    ...              'ap-northeast-2',
+    ...              'ap-southeast-1',
+    ...              'ap-southeast-2',
+    ...              'ap-northeast-1',
+    ...              'ca-central-1',
+    ...              'eu-central-1',
+    ...              'eu-west-1',
+    ...              'eu-west-2',
+    ...              'eu-west-3',
+    ...              'eu-north-1',
+    ...              'sa-east-1'
+    ...              )
+    ...              ;
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...               ${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}instanceId${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}${SPACE}${SPACE}ipAddress${SPACE}${SPACE}${SPACE}${SPACE}
+    ...               ---------------------+----------------
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               ${SPACE}i-1234567890abcdef0${SPACE}|${SPACE}54.194.252.215
+    ...               (17${SPACE}rows)
+    ...               ${EMPTY}
+    Should PG Client Inline Equal Bench
+    ...    ${CURDIR}
+    ...    ${PSQL_EXE}
+    ...    ${PSQL_MTLS_CONN_STR}
+    ...    ${inputStr}
+    ...    ${outputStr}
+    ...    max_mean_time=1.7
+
+Acceptable Secure Connection to mTLS Server Returns Success Message
+    ${input} =     Catenate
+    ...    echo     ""     |
+    ...    openssl     s_client     -starttls    postgres 
+    ...    -connect     ${PSQL_CLIENT_HOST}:${PG_SRV_PORT_MTLS}
+    ...    -cert       ${STACKQL_PG_CLIENT_CERT_PATH}
+    ...    -key        ${STACKQL_PG_CLIENT_KEY_PATH}
+    ...    -CAfile     ${STACKQL_PG_SERVER_CERT_PATH}
+    ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+    ${result} =    Run Process
+    ...    ${shellExe}     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/Acceptable-Secure-Connection-to-mTLS-Server-Returns-Success-Message.tmp
+    ...    stderr=${CURDIR}/tmp/Acceptable-Secure-Connection-to-mTLS-Server-Returns-Success-Message-stderr.tmp
+    Should Contain    ${result.stdout}    Verify return code: 0
+
+Unacceptable Insecure Connection to mTLS Server Returns Error Message
+    ${input} =     Catenate
+    ...    echo     ""     |
+    ...    openssl     s_client     -starttls    postgres 
+    ...    -connect     ${PSQL_CLIENT_HOST}:${PG_SRV_PORT_MTLS}
+    ...    -cert       ${STACKQL_PG_CLIENT_CERT_PATH}
+    ...    -key        ${STACKQL_PG_CLIENT_KEY_PATH}
+    ...    -CAfile     ${STACKQL_PG_RUBBISH_CERT_PATH}
+    ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+    ${result} =    Run Process
+    ...    ${shellExe}     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/Unacceptable-Insecure-Connection-to-mTLS-Server-Returns-Error-Message.tmp
+    ...    stderr=${CURDIR}/tmp/Unacceptable-Insecure-Connection-to-mTLS-Server-Returns-Error-Message-stderr.tmp
+    Should Contain    ${result.stdout}    Verify return code: 18
+
+Acceptable Secure PSQL Connection to mTLS Server With Diagnostic Query Returns Connection Info
+    ${posixInput} =     Catenate
+    ...    "${PSQL_EXE}"    -d     "${PSQL_MTLS_CONN_STR_UNIX}" -c "\\conninfo"
+    ${windowsInput} =     Catenate
+    ...    &    ${posixInput}
+    ${input} =    Set Variable If    "${IS_WINDOWS}" == "1"    ${windowsInput}    ${posixInput}
+    ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+    ${result} =    Run Process
+    ...    ${shellExe}     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/Acceptable-Secure-PSQL-Connection-to-mTLS-Server-With-Diagnostic-Query-Returns-Connection-Info.tmp
+    ...    stderr=${CURDIR}/tmp/Acceptable-Secure-PSQL-Connection-to-mTLS-Server-With-Diagnostic-Query-Returns-Connection-Info-stderr.tmp
+    Should Contain    ${result.stdout}    TLSv1.3
+
+Acceptable Password Only PSQL Connection Defined by Env Vars to Server With Diagnostic Query Returns Connection Info
+    Set Environment Variable    PGHOST           ${PSQL_CLIENT_HOST}
+    Set Environment Variable    PGPORT           ${PG_SRV_PORT_UNENCRYPTED}
+    Set Environment Variable    PGUSER           stackql
+    Set Environment Variable    PGPASSWORD       ${PSQL_PASSWORD} 
+    ${posixInput} =     Catenate
+    ...    "${PSQL_EXE}" -c "\\conninfo"
+    ${windowsInput} =     Catenate
+    ...    &    ${posixInput}
+    ${input} =    Set Variable If    "${IS_WINDOWS}" == "1"    ${windowsInput}    ${posixInput}
+    ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+    ${result} =    Run Process
+    ...    ${shellExe}     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/Acceptable-Password-Only-PSQL-Connection-Defined-by-Env-Vars-to-Server-With-Diagnostic-Query-Returns-Connection-Info.tmp
+    ...    stderr=${CURDIR}/tmp/Acceptable-Password-Only-PSQL-Connection-Defined-by-Env-Vars-to-Server-With-Diagnostic-Query-Returns-Connection-Info-stderr.tmp
+    Should Match Regexp    ${result.stdout}    (You are connected to database|Connection Information)
+    [Teardown]  Run Keywords    Remove Environment Variable     PGHOST
+    ...         AND             Remove Environment Variable     PGPORT
+    ...         AND             Remove Environment Variable     PGUSER 
+    ...         AND             Remove Environment Variable     PGPASSWORD
+
+Acceptable Secure PSQL Connection Defined by Env Vars to mTLS Server With Diagnostic Query Returns Connection Info
+    Set Environment Variable    PGHOST           ${PSQL_CLIENT_HOST}
+    Set Environment Variable    PGPORT           ${PG_SRV_PORT_MTLS}
+    Set Environment Variable    PGSSLMODE        verify\-full 
+    Set Environment Variable    PGSSLCERT        ${STACKQL_PG_CLIENT_CERT_PATH} 
+    Set Environment Variable    PGSSLKEY         ${STACKQL_PG_CLIENT_KEY_PATH} 
+    Set Environment Variable    PGSSLROOTCERT    ${STACKQL_PG_SERVER_CERT_PATH} 
+    ${posixInput} =     Catenate
+    ...    "${PSQL_EXE}" -c "\\conninfo"
+    ${windowsInput} =     Catenate
+    ...    &    ${posixInput}
+    ${input} =    Set Variable If    "${IS_WINDOWS}" == "1"    ${windowsInput}    ${posixInput}
+    ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+    ${result} =    Run Process
+    ...    ${shellExe}     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/Acceptable-Secure-PSQL-Connection-Defined-by-Env-Vars-to-mTLS-Server-With-Diagnostic-Query-Returns-Connection-Info.tmp
+    ...    stderr=${CURDIR}/tmp/Acceptable-Secure-PSQL-Connection-Defined-by-Env-Vars-to-mTLS-Server-With-Diagnostic-Query-Returns-Connection-Info-stderr.tmp
+    Should Contain    ${result.stdout}    TLSv1.3
+    [Teardown]  Run Keywords    Remove Environment Variable     PGHOST
+    ...         AND             Remove Environment Variable     PGPORT
+    ...         AND             Remove Environment Variable     PGSSLMODE 
+    ...         AND             Remove Environment Variable     PGSSLCERT 
+    ...         AND             Remove Environment Variable     PGSSLKEY
+    ...         AND             Remove Environment Variable     PGSSLROOTCERT
+
+Unacceptable Insecure PSQL Connection to mTLS Server Returns Error Message
+    ${posixInput} =     Catenate
+    ...    "${PSQL_EXE}"    -d    "${PSQL_MTLS_DISABLE_CONN_STR_UNIX}" -c "\\conninfo"
+    ${windowsInput} =     Catenate
+    ...    &    ${posixInput}
+    ${input} =    Set Variable If    "${IS_WINDOWS}" == "1"    ${windowsInput}    ${posixInput}
+    ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+    ${result} =    Run Process
+    ...    ${shellExe}     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/Unacceptable-Insecure-PSQL-Connection-to-mTLS-Server-Returns-Error-Message.tmp
+    ...    stderr=${CURDIR}/tmp/Unacceptable-Insecure-PSQL-Connection-to-mTLS-Server-Returns-Error-Message-stderr.tmp
+    Should Contain    ${result.stderr}    server closed the connection unexpectedly
+
+PG Session Debug Behaviour Canonical
+    [Documentation]   The mTLS servers have debug on
+    Set Environment Variable    PGHOST           ${PSQL_CLIENT_HOST}
+    Set Environment Variable    PGPORT           ${PG_SRV_PORT_MTLS}
+    Set Environment Variable    PGSSLMODE        verify\-full 
+    Set Environment Variable    PGSSLCERT        ${STACKQL_PG_CLIENT_CERT_PATH} 
+    Set Environment Variable    PGSSLKEY         ${STACKQL_PG_CLIENT_KEY_PATH} 
+    Set Environment Variable    PGSSLROOTCERT    ${STACKQL_PG_SERVER_CERT_PATH} 
+    ${inputStr} =    Catenate
+    ...    SELECT repo, count(1) as has_starred
+    ...    FROM github.activity.repo_stargazers    
+    ...    WHERE owner = 'sillyorg' and repo in ('silly', 'silly-but-more') and login = 'sillylogin'
+    ...    GROUP BY repo;
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    repo | has_starred 
+    ...    ------+-------------
+    ...    (0 rows)
+    ${outputErrStr} =    Catenate    SEPARATOR=\n
+    ...    NOTICE:  a notice level event has occurred
+    ...    DETAIL:  http response status code: 403, response body: "{\\"message\\":\\"API rate limit exceeded for 111.1111.111.11. (But here's the good news: Authenticated requests get a higher rate limit. Check out the documentation for more details.) If you reach out to GitHub Support for help, please include the request ID AAAA:AAAA:BBBBBB:BBBBBB:BBBBBBBB and timestamp 2025-01-01 01:00:00 UTC.\\",\\"documentation_url\\":\\"https://docs.github.com/rest/overview/rate-limits-for-the-rest-api\\",\\"status\\":\\"403\\"}"
+    ...    
+    ...    http response status code: 403, response body: "{\\"message\\":\\"API rate limit exceeded for 111.1111.111.11. (But here's the good news: Authenticated requests get a higher rate limit. Check out the documentation for more details.) If you reach out to GitHub Support for help, please include the request ID AAAA:AAAA:BBBBBB:BBBBBB:BBBBBBBB and timestamp 2025-01-01 01:00:00 UTC.\\",\\"documentation_url\\":\\"https://docs.github.com/rest/overview/rate-limits-for-the-rest-api\\",\\"status\\":\\"403\\"}" 
+    ${posixInput} =     Catenate
+    ...    "${PSQL_EXE}" -c "${inputStr}"
+    ${windowsInput} =     Catenate
+    ...    &    ${posixInput}
+    ${input} =    Set Variable If    "${IS_WINDOWS}" == "1"    ${windowsInput}    ${posixInput}
+    ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+    ${result} =    Run Process
+    ...    ${shellExe}     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Debug-Behaviour-Canonical.tmp
+    ...    stderr=${CURDIR}/tmp/PG-Session-Debug-Behaviour-Canonical-stderr.tmp
+    Log    STDOUT = "${result.stdout}"
+    Log    STDERR = "${result.stderr}"
+    # Should Contain    ${result.stdout}    ${outputStr}    collapse_spaces=True
+    Should Contain    ${result.stderr}    ${outputErrStr}    collapse_spaces=True
+    [Teardown]  Run Keywords    Remove Environment Variable     PGHOST
+    ...         AND             Remove Environment Variable     PGPORT
+    ...         AND             Remove Environment Variable     PGSSLMODE 
+    ...         AND             Remove Environment Variable     PGSSLCERT 
+    ...         AND             Remove Environment Variable     PGSSLKEY
+    ...         AND             Remove Environment Variable     PGSSLROOTCERT
+
+PG Session Debug Off Behaviour Canonical
+    [Documentation]   The unencrypted servers have debug off
+    Set Environment Variable    PGHOST           ${PSQL_CLIENT_HOST}
+    Set Environment Variable    PGPORT           ${PG_SRV_PORT_UNENCRYPTED}
+    Set Environment Variable    PGUSER           stackql
+    Set Environment Variable    PGPASSWORD       ${PSQL_PASSWORD} 
+    ${inputStr} =    Catenate
+    ...    SELECT repo, count(1) as has_starred
+    ...    FROM github.activity.repo_stargazers    
+    ...    WHERE owner = 'sillyorg' and repo in ('silly', 'silly-but-more') and login = 'sillylogin'
+    ...    GROUP BY repo;
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    repo | has_starred 
+    ...    ------+-------------
+    ...    (0 rows)
+    ${posixInput} =     Catenate
+    ...    "${PSQL_EXE}" -c "${inputStr}"
+    ${windowsInput} =     Catenate
+    ...    &    ${posixInput}
+    ${input} =    Set Variable If    "${IS_WINDOWS}" == "1"    ${windowsInput}    ${posixInput}
+    ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+    ${result} =    Run Process
+    ...    ${shellExe}     \-c    ${input}
+    ...    stdout=${CURDIR}/tmp/PG-Session-Debug-Off-Behaviour-Canonical.tmp
+    ...    stderr=${CURDIR}/tmp/PG-Session-Debug-Off-Behaviour-Canonical-stderr.tmp
+    Log    STDOUT = "${result.stdout}"
+    Log    STDERR = "${result.stderr}"
+    # Should Contain     ${result.stdout}    ${outputStr}   collapse_spaces=True
+    Should Be Empty    ${result.stderr}
+    [Teardown]  Run Keywords    Remove Environment Variable     PGHOST
+    ...         AND             Remove Environment Variable     PGPORT
+    ...         AND             Remove Environment Variable     PGUSER 
+    ...         AND             Remove Environment Variable     PGPASSWORD
+
+Server Stability PG Session Repeat AWS EC2 Select
+    [Documentation]   Repeat the same query over psql many times as a marker of server stability
+    Set Environment Variable    PGHOST           ${PSQL_CLIENT_HOST}
+    Set Environment Variable    PGPORT           ${PG_SRV_PORT_UNENCRYPTED}
+    Set Environment Variable    PGUSER           stackql
+    Set Environment Variable    PGPASSWORD       ${PSQL_PASSWORD} 
+    ${inputStr} =    Catenate
+    ...              select 
+    ...              instanceId, ipAddress 
+    ...              from aws.ec2.instances 
+    ...              where 
+    ...              region = 'ap-southeast-2'
+    ...              and instanceId not in ('some-silly-id') 
+    ...              and ipAddress in ('54.194.252.215')
+    ...              and region in ('ap-southeast-2')
+    ...              ;
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...         instanceId      |   ipAddress    
+    ...    ---------------------+----------------
+    ...     i-1234567890abcdef0 | 54.194.252.215
+    ...    (1 row)
+    FOR    ${index}    IN RANGE    100
+        LOG    runnning index = ${index}
+        ${posixInput} =     Catenate
+        ...    "${PSQL_EXE}" -c "${inputStr}"
+        ${windowsInput} =     Catenate
+        ...    &    ${posixInput}
+        ${input} =    Set Variable If    "${IS_WINDOWS}" == "1"    ${windowsInput}    ${posixInput}
+        ${shellExe} =    Set Variable If    "${IS_WINDOWS}" == "1"    powershell    sh
+        ${result} =    Run Process
+        ...    ${shellExe}     \-c    ${input}
+        ...    stdout=${CURDIR}/tmp/Server-Stability-PG-Session-Repeat-AWS-EC2-Select-${index}.tmp
+        ...    stderr=${CURDIR}/tmp/Server-Stability-PG-Session-Repeat-AWS-EC2-Select-${index}-stderr.tmp
+        Log    STDOUT = "${result.stdout}"
+        Log    STDERR = "${result.stderr}"
+        Should Contain     ${result.stdout}    ${outputStr}   collapse_spaces=True
+        Should Be Empty    ${result.stderr}
+    END
+    [Teardown]  Run Keywords    Remove Environment Variable     PGHOST
+    ...         AND             Remove Environment Variable     PGPORT
+    ...         AND             Remove Environment Variable     PGUSER 
+    ...         AND             Remove Environment Variable     PGPASSWORD
+
+Legacy Purge Commands Preserve Stored Relations
+    [Documentation]    Legacy GC commands cannot erase catalogue entries or user data,
+    ...    including a user table whose name matches the analytics cache namespace.
+    ${query} =    Catenate
+    ...    create table stackql_analytics_gc_guard (value text);
+    ...    insert into stackql_analytics_gc_guard (value) values ('retained');
+    ...    create view gc_guard_view as select upper(value) as value from stackql_analytics_gc_guard;
+    ...    create materialized view gc_guard_materialized as select value from stackql_analytics_gc_guard;
+    ...    purge control_tables; purge ephemeral; purge cache; purge; purge conservative;
+    ...    select value from gc_guard_view;
+    ...    select value from gc_guard_materialized;
+    ...    drop materialized view gc_guard_materialized;
+    ...    drop view gc_guard_view;
+    ...    drop table stackql_analytics_gc_guard;
+    ${output} =    Run Stackql Exec Command No Errors
+    ...    ${STACKQL_EXE}    ${OKTA_SECRET_STR}    ${GITHUB_SECRET_STR}    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}    ${AUTH_CFG_STR}    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${query}    stackql_output=csv
+    Should Contain    ${output.stdout}    RETAINED
+    Should Contain    ${output.stdout}    retained
+    [Teardown]    Stackql Per Test Teardown

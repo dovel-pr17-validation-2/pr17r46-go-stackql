@@ -1,0 +1,1114 @@
+*** Settings ***
+Resource          ${CURDIR}/stackql.resource
+
+*** Test Cases *** 
+Positive Control
+    Should contain    ''    ''
+
+Get Providers
+    Should StackQL Exec Contain    ${SHOW_PROVIDERS_STR}   okta
+    Should StackQL Novel Exec Contain    ${SHOW_PROVIDERS_STR}   v0.3.1
+    Should StackQL Exec Contain JSON output    ${SHOW_PROVIDERS_STR}   okta
+
+Get Providers JSONL
+    Should StackQL Exec Contain JSONL output    ${SHOW_PROVIDERS_STR}    "name":"okta"
+
+AWS VPN Gateways Empty JSONL Exact
+    [Documentation]    Deterministic mock-backed query with ORDER BY; expect exact empty JSONL output.
+    Should StackQL Exec Equal JSONL output    ${SELECT_AWS_EC2_VPN_GATEWAYS_NULL}    ${EMPTY}
+
+Get Providers No Config
+    Should StackQL No Cfg Exec Contain    ${SHOW_PROVIDERS_STR}   name
+
+Get Okta Services
+    Should StackQL Exec Contain    ${SHOW_OKTA_SERVICES_FILTERED_STR}    Application${SPACE}API
+
+Get Okta Application Resources
+    Should StackQL Exec Contain    ${SHOW_OKTA_APPLICATION_RESOURCES_FILTERED_STR}    grants    groups
+
+Describe GitHub Repos Pages
+    Should StackQL Novel Exec Contain    ${DESCRIBE_GITHUB_REPOS_PAGES}    https_certificate    url
+
+Describe AWS EC2 Instances Exemplifies Deep XPath for schema
+    Should StackQL NoVerify Only Exec Contain    ${DESCRIBE_AWS_EC2_INSTANCES}
+                                                 ...  architecture    bootMode    subnetId
+                                                 ...  stdout=${CURDIR}/tmp/describe-aws-ec2-instances.tmp
+
+Describe AWS EC2 Default KMS Key ID Exemplifies Top Level XPath for schema
+    Should StackQL NoVerify Only Exec Contain    ${DESCRIBE_AWS_EC2_DEFAULT_KMS_KEY_ID}
+                                                 ...  kmsKeyId
+                                                 ...  stdout=${CURDIR}/tmp/describe-aws-ec2-default-kms-key-id.tmp
+
+Describe Method Returns Input And Output Rows
+    [Documentation]    DESCRIBE METHOD google.storage.buckets.get returns rows
+    ...                tagged input_required, input_optional, and output.
+    Should StackQL NoVerify Only Exec Contain    describe method google.storage.buckets.get;
+                                                 ...  bucket    input_required    output
+                                                 ...  stdout=${CURDIR}/tmp/describe-method-google-storage-buckets-get.tmp
+
+Describe Method Extended Includes Description
+    [Documentation]    EXTENDED variant includes a description column populated
+    ...                from the source schema.
+    Should StackQL NoVerify Only Exec Contain    describe method extended google.storage.buckets.get;
+                                                 ...  description
+                                                 ...  stdout=${CURDIR}/tmp/describe-method-extended-google-storage-buckets-get.tmp
+
+Describe Method Renders Shape For Nested Object
+    [Documentation]    Object fields carry a JSON Schema subset in the shape column;
+    ...                deep nesting (iamConfiguration.bucketPolicyOnly.enabled) is
+    ...                preserved in one query.
+    Should StackQL NoVerify Only Exec Contain    describe method google.storage.buckets.get;
+                                                 ...  iamConfiguration    bucketPolicyOnly
+                                                 ...  stdout=${CURDIR}/tmp/describe-method-shape-nested.tmp
+
+Describe Method Insert Has Required Body Field
+    [Documentation]    The buckets.insert method has a method-level
+    ...                request.required: [name] annotation; name must surface
+    ...                as input_required regardless of body-translation algorithm.
+    Should StackQL NoVerify Only Exec Contain    describe method google.storage.buckets.insert;
+                                                 ...  name    input_required
+                                                 ...  stdout=${CURDIR}/tmp/describe-method-google-storage-buckets-insert.tmp
+
+Describe Method Delete Has No Output Rows
+    [Documentation]    Methods that return 204 No Content emit zero output rows.
+    Should StackQL NoVerify Only Exec Contain    describe method google.storage.buckets.delete;
+                                                 ...  input_required
+                                                 ...  stdout=${CURDIR}/tmp/describe-method-google-storage-buckets-delete.tmp
+
+Describe Table Still Works Unchanged
+    [Documentation]    Regression guard: existing DESCRIBE behaviour is byte-identical -
+    ...                no param_type column appears for the DESCRIBE TABLE form.
+    Should StackQL NoVerify Only Exec Contain    ${DESCRIBE_GOOGLE_STORAGE_BUCKETS}
+                                                 ...  name    type
+                                                 ...  stdout=${CURDIR}/tmp/describe-google-storage-buckets.tmp
+
+Describe allOf Object Returns Expected Result
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}name${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}${SPACE}type${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}id${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}@odata.type${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}aboutMe${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}accountEnabled${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}activities${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}ageGroup${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}agreementAcceptances${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}appRoleAssignments${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}assignedLicenses${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}assignedPlans${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}authentication${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}authorizationInfo${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}birthday${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}businessPhones${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}calendar${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}calendarGroups${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}calendarView${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}calendars${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}chats${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}city${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}companyName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}consentProvidedForMinor${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}contactFolders${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}contacts${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}country${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}createdDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}createdObjects${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}creationType${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}customSecurityAttributes${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}deletedDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}department${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}deviceEnrollmentLimit${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}integer${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}deviceManagementTroubleshootingEvents${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}directReports${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}displayName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}drive${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}drives${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}employeeExperience${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}employeeHireDate${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}employeeId${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}employeeLeaveDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}employeeOrgData${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}employeeType${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}events${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}extensions${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}externalUserState${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}externalUserStateChangeDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}faxNumber${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}followedSites${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}givenName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}hireDate${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}identities${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}imAddresses${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}inferenceClassification${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}insights${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}interests${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}isResourceAccount${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}jobTitle${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}joinedTeams${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}lastPasswordChangeDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}legalAgeGroupClassification${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}licenseAssignmentStates${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}licenseDetails${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}mail${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}mailFolders${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}mailNickname${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}mailboxSettings${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}managedAppRegistrations${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}managedDevices${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}manager${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}memberOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}messages${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}mobilePhone${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}mySite${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}oauth2PermissionGrants${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}officeLocation${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesDistinguishedName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesDomainName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesExtensionAttributes${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesImmutableId${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesLastSyncDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesProvisioningErrors${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesSamAccountName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesSecurityIdentifier${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesSyncEnabled${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onPremisesUserPrincipalName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onenote${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}onlineMeetings${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}otherMails${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}outlook${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}ownedDevices${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}ownedObjects${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}passwordPolicies${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}passwordProfile${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}pastProjects${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}people${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}photo${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}photos${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}planner${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}postalCode${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}preferredDataLocation${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}preferredLanguage${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}preferredName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}presence${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}print${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}provisionedPlans${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}proxyAddresses${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}registeredDevices${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}responsibilities${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}schools${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}scopedRoleMemberOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}securityIdentifier${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}serviceProvisioningErrors${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}settings${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}showInAddressList${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}signInActivity${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}signInSessionsValidFromDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}skills${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}state${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}streetAddress${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}surname${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}teamwork${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}todo${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}transitiveMemberOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}usageLocation${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}userPrincipalName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    ...    |${SPACE}userType${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |---------------------------------------|---------|
+    Should StackQL Current Exec Equal    
+    ...    describe stackql_test.users.users;
+    ...    ${outputStr}
+    ...    stdout=${CURDIR}/tmp/Describe-allOf-Object-Returns-Expected-Result.tmp
+    ...    stderr=${CURDIR}/tmp/Describe-allOf-Object-Returns-Expected-Result-stderr.tmp
+
+Describe anyOf Object Returns Expected Result
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}name${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}${SPACE}type${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}id${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}description${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}@odata.type${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}acceptedSenders${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}address${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}allowExternalSenders${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}appRoleAssignments${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}assignedLabels${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}assignedLicenses${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}autoSubscribeNewMembers${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}calendar${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}calendarView${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}classification${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}conversations${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}coordinates${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}createdDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}createdOnBehalfOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}deletedDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}displayName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}drive${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}drives${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}events${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}expirationDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}extensions${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}groupLifecyclePolicies${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}groupTypes${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}hasMembersWithLicenseErrors${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}hideFromAddressLists${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}hideFromOutlookClients${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}isArchived${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}isAssignableToRole${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}isSubscribedByMail${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}licenseProcessingState${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}locationEmailAddress${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}locationType${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}text${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}locationUri${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}mail${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}mailEnabled${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}mailNickname${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}memberOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}members${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}membersWithLicenseErrors${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}membershipRule${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}membershipRuleProcessingState${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesDomainName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesLastSyncDateTime${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesNetBiosName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesProvisioningErrors${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesSamAccountName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesSecurityIdentifier${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesSyncEnabled${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onenote${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}owners${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}permissionGrants${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}photo${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}photos${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}planner${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}preferredDataLocation${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}preferredLanguage${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}proxyAddresses${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}rejectedSenders${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}renewedDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}securityEnabled${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}securityIdentifier${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}serviceProvisioningErrors${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}settings${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}sites${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}team${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}theme${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}threads${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}transitiveMemberOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}transitiveMembers${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}uniqueId${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}uniqueIdType${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}text${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}unseenCount${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}integer${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}visibility${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    Should StackQL Current Exec Equal    
+    ...    describe stackql_test.totally_contrived.any_of_explore;
+    ...    ${outputStr}
+    ...    stdout=${CURDIR}/tmp/Describe-anyOf-Object-Returns-Expected-Result.tmp
+    ...    stderr=${CURDIR}/tmp/Describe-anyOf-Object-Returns-Expected-Result-stderr.tmp
+
+Describe oneOf Object Returns Expected Result
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}name${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}${SPACE}type${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}id${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}description${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}@odata.type${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}acceptedSenders${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}address${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}allowExternalSenders${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}appRoleAssignments${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}assignedLabels${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}assignedLicenses${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}autoSubscribeNewMembers${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}calendar${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}calendarView${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}classification${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}conversations${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}coordinates${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}createdDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}createdOnBehalfOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}deletedDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}displayName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}drive${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}drives${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}events${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}expirationDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}extensions${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}groupLifecyclePolicies${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}groupTypes${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}hasMembersWithLicenseErrors${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}hideFromAddressLists${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}hideFromOutlookClients${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}isArchived${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}isAssignableToRole${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}isSubscribedByMail${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}licenseProcessingState${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}locationEmailAddress${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}locationType${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}text${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}locationUri${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}mail${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}mailEnabled${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}mailNickname${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}memberOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}members${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}membersWithLicenseErrors${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}membershipRule${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}membershipRuleProcessingState${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesDomainName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesLastSyncDateTime${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesNetBiosName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesProvisioningErrors${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesSamAccountName${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesSecurityIdentifier${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onPremisesSyncEnabled${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}onenote${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}owners${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}permissionGrants${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}photo${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}photos${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}planner${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}preferredDataLocation${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}preferredLanguage${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}proxyAddresses${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}rejectedSenders${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}renewedDateTime${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}securityEnabled${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}bool${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}securityIdentifier${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}serviceProvisioningErrors${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}settings${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}sites${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}team${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}object${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}theme${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}threads${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}transitiveMemberOf${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}transitiveMembers${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}array${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}uniqueId${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}uniqueIdType${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}text${SPACE}${SPACE}${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}unseenCount${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}integer${SPACE}|
+    ...    |-------------------------------|---------|
+    ...    |${SPACE}visibility${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}string${SPACE}${SPACE}|
+    ...    |-------------------------------|---------|
+    Should StackQL Current Exec Equal    
+    ...    describe stackql_test.totally_contrived.one_of_explore;
+    ...    ${outputStr}
+    ...    stdout=${CURDIR}/tmp/Describe-oneOf-Object-Returns-Expected-Result.tmp
+    ...    stderr=${CURDIR}/tmp/Describe-oneOf-Object-Returns-Expected-Result-stderr.tmp
+
+Show Methods GitHub
+    Should StackQL Novel Exec Equal    ${SHOW_METHODS_GITHUB_REPOS_REPOS}   ${SHOW_METHODS_GITHUB_REPOS_REPOS_EXPECTED}
+
+Show Methods including server params AWS 
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    |---------------|----------------|---------|
+    ...    |${SPACE}${SPACE}MethodName${SPACE}${SPACE}${SPACE}|${SPACE}RequiredParams${SPACE}|${SPACE}SQLVerb${SPACE}|
+    ...    |---------------|----------------|---------|
+    ...    |${SPACE}vpcs_Describe${SPACE}|${SPACE}region${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}SELECT${SPACE}${SPACE}|
+    ...    |---------------|----------------|---------|
+    ...    |${SPACE}vpc_Create${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}region${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}INSERT${SPACE}${SPACE}|
+    ...    |---------------|----------------|---------|
+    ...    |${SPACE}vpc_Delete${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}VpcId,${SPACE}region${SPACE}${SPACE}|${SPACE}DELETE${SPACE}${SPACE}|
+    ...    |---------------|----------------|---------|
+    Should StackQL Current Exec Equal    
+    ...    show methods in aws.ec2.vpcs;
+    ...    ${outputStr}
+
+Show Methods including view 
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    |------------|----------------|---------|
+    ...    |${SPACE}MethodName${SPACE}|${SPACE}RequiredParams${SPACE}|${SPACE}SQLVerb${SPACE}|
+    ...    |------------|----------------|---------|
+    ...    |${SPACE}__view__${SPACE}${SPACE}${SPACE}|${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}SELECT${SPACE}${SPACE}|
+    ...    |------------|----------------|---------|
+    Should StackQL Current Exec Equal    
+    ...    show methods in aws.pseudo_s3.s3_bucket_listing;
+    ...    ${outputStr}
+
+Show Methods including view and others 
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    |-----------------|----------------|---------|
+    ...    |${SPACE}${SPACE}${SPACE}MethodName${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}RequiredParams${SPACE}|${SPACE}SQLVerb${SPACE}|
+    ...    |-----------------|----------------|---------|
+    ...    |${SPACE}__view__${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}SELECT${SPACE}${SPACE}|
+    ...    |-----------------|----------------|---------|
+    ...    |${SPACE}create_resource${SPACE}|${SPACE}region${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}INSERT${SPACE}${SPACE}|
+    ...    |-----------------|----------------|---------|
+    Should StackQL Current Exec Equal    
+    ...    show methods in aws.pseudo_s3.s3_bucket_detail_defaulted;
+    ...    ${outputStr}
+
+Show Methods including required params view and others 
+    ${outputStr} =    Catenate    SEPARATOR=\n
+    ...    |-----------------|--------------------------|---------|
+    ...    |${SPACE}${SPACE}${SPACE}MethodName${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}RequiredParams${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}SQLVerb${SPACE}|
+    ...    |-----------------|--------------------------|---------|
+    ...    |${SPACE}__view__${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}data__Identifier,${SPACE}region${SPACE}|${SPACE}SELECT${SPACE}${SPACE}|
+    ...    |-----------------|--------------------------|---------|
+    ...    |${SPACE}create_resource${SPACE}|${SPACE}region${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}${SPACE}|${SPACE}INSERT${SPACE}${SPACE}|
+    ...    |-----------------|--------------------------|---------|
+    Should StackQL Current Exec Equal    
+    ...    show methods in aws.pseudo_s3.s3_bucket_polymorphic;
+    ...    ${outputStr}
+
+Show Insert Google Container Clusters
+    Should StackQL Exec Contain    
+    ...    SHOW INSERT INTO google.container."projects.zones.clusters";
+    ...    ${SHOW_INSERT_GOOGLE_CONTAINER_CLUSTERS} 
+    ...    stackql_H=True
+    ...    stdout=${CURDIR}/tmp/Show-Insert-Google-Container-Clusters.tmp
+    
+JSONNET Plus Env Vars
+    ${varList}=    Create List    project=stackql-demo    region=australia-southeast1
+    Should StackQL Exec Equal    
+    ...    ""
+    ...    ${JSONNET_PLUS_ENV_VARS_EXPECTED} 
+    ...    stackql_H=True 
+    ...    stackql_dryrun=True
+    ...    stackql_i=${JSONNET_PLUS_ENV_VARS_QUERY_FILE}
+    ...    stackql_vars=${varList}
+    ...    stackql_iqldata=${JSONNET_PLUS_ENV_VARS_VAR_FILE}
+    ...    stdout=${CURDIR}/tmp/JSONNET-Plus-Env-Vars.tmp
+
+Show Extended Insert Google BQ Datasets
+    Should StackQL Exec Contain    
+    ...    SHOW EXTENDED INSERT INTO google.bigquery.datasets;
+    ...    ${SHOW_INSERT_EXTENDED_GOOGLE_BIGQUERY_DATASET} 
+    ...    stackql_H=True
+    ...    stdout=${CURDIR}/tmp/Show-Extended-Insert-Google-BQ-Datasets.tmp   
+
+Show Insert Google BQ Datasets
+    Should StackQL Exec Contain
+    ...    SHOW INSERT INTO google.bigquery.datasets;
+    ...    ${SHOW_INSERT_GOOGLE_BIGQUERY_DATASET}
+    ...    stackql_H=True
+    ...    stdout=${CURDIR}/tmp/Show-Insert-Google-BQ-Datasets.tmp
+
+Show Version
+    [Documentation]    Verify the SHOW VERSION column header is rendered and that
+    ...                the value has the expected build suffix. A literal patch
+    ...                check is intentionally avoided because the patch component
+    ...                is the CI run number and changes on every build.
+    Should StackQL Exec Contain
+    ...    SHOW VERSION;
+    ...    version
+    ...    stdout=${CURDIR}/tmp/Show-Version.tmp
+    ${captured}=    Get File    ${CURDIR}/tmp/Show-Version.tmp
+    Should Match Regexp    ${captured}    \\|\\s*\\d+\\.\\d+\\.\\d+%{BUILDPRERELEASESUFFIX=}\\s*\\|
+
+Show Version Extended
+    [Documentation]    Verify the SHOW EXTENDED VERSION column headers are
+    ...                rendered and that the version cell matches a generic
+    ...                semver with the expected suffix (patch varies per CI run).
+    Should StackQL Exec Contain
+    ...    SHOW EXTENDED VERSION;
+    ...    version
+    ...    stdout=${CURDIR}/tmp/Show-Version-Extended.tmp
+    Should StackQL Exec Contain
+    ...    SHOW EXTENDED VERSION;
+    ...    commit
+    ...    stdout=${CURDIR}/tmp/Show-Version-Extended-Commit.tmp
+    Should StackQL Exec Contain
+    ...    SHOW EXTENDED VERSION;
+    ...    build_date
+    ...    stdout=${CURDIR}/tmp/Show-Version-Extended-BuildDate.tmp
+    Should StackQL Exec Contain
+    ...    SHOW EXTENDED VERSION;
+    ...    platform
+    ...    stdout=${CURDIR}/tmp/Show-Version-Extended-Platform.tmp
+    ${captured}=    Get File    ${CURDIR}/tmp/Show-Version-Extended.tmp
+    Should Match Regexp    ${captured}    \\|\\s*\\d+\\.\\d+\\.\\d+%{BUILDPRERELEASESUFFIX=}\\s*\\|
+
+Reported Version Includes Expected Prerelease Suffix
+    [Documentation]    Check the exact complete version value, rejecting missing or unexpected suffixes.
+    FOR    ${query}    IN    SHOW VERSION;    SHOW EXTENDED VERSION;
+        Should StackQL Exec Contain JSON output
+        ...    ${query}
+        ...    version
+        ...    stdout=${CURDIR}/tmp/Expected-Prerelease-Version.json
+        ${captured}=    Get File    ${CURDIR}/tmp/Expected-Prerelease-Version.json
+        ${rows}=    Evaluate    json.loads($captured)    modules=json
+        Length Should Be    ${rows}    1
+        Should Match Regexp    ${rows}[0][version]    ^\\d+\\.\\d+\\.\\d+%{BUILDPRERELEASESUFFIX=}$
+    END
+
+Show Contributors
+    [Documentation]    Issue #320: SHOW CONTRIBUTORS renders the embedded
+    ...                leaderboard, contributions descending, founder on top.
+    Should StackQL Exec Contain
+    ...    SHOW CONTRIBUTORS;
+    ...    contributor
+    ...    stdout=${CURDIR}/tmp/Show-Contributors.tmp
+    ${captured}=    Get File    ${CURDIR}/tmp/Show-Contributors.tmp
+    Should Match Regexp    ${captured}    (?s)general-kroll-4-life.*jeffreyaven
+    Should Not Contain    ${captured}    contributions
+
+Show Contributors Extended
+    [Documentation]    SHOW EXTENDED CONTRIBUTORS adds the contributions count.
+    Should StackQL Exec Contain
+    ...    SHOW EXTENDED CONTRIBUTORS;
+    ...    contributions
+    ...    stdout=${CURDIR}/tmp/Show-Contributors-Extended.tmp
+    ${captured}=    Get File    ${CURDIR}/tmp/Show-Contributors-Extended.tmp
+    Should Match Regexp    ${captured}    (?s)general-kroll-4-life.*jeffreyaven
+
+*** Keywords ***
+Should StackQL Exec Equal
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_CANONICAL_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_DEPRECATED_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+
+Should StackQL Current Exec Equal
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+
+Should StackQL Novel Exec Equal
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_CANONICAL_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+
+Should StackQL Exec Contain
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_CANONICAL_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_DEPRECATED_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+
+Should StackQL Exec Contain JSON output
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=json
+    ...    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_CANONICAL_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=json
+    ...    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_DEPRECATED_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=json
+    ...    &{kwargs}
+
+Should StackQL Exec Contain JSONL output
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=jsonl
+    ...    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_CANONICAL_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=jsonl
+    ...    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_DEPRECATED_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=jsonl
+    ...    &{kwargs}
+
+Should StackQL Exec Equal JSONL output
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=jsonl
+    ...    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_CANONICAL_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=jsonl
+    ...    &{kwargs}
+    Should StackQL Exec Inline Equal
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_DEPRECATED_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    \-o\=jsonl
+    ...    &{kwargs}
+
+Should StackQL Novel Exec Contain
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_CANONICAL_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+
+Should StackQL NoVerify Only Exec Contain
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NO_VERIFY_CFG_STR}
+    ...    ${AUTH_CFG_STR}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+
+Should StackQL No Cfg Exec Contain
+    [Arguments]    ${_EXEC_CMD_STR}    ${_EXEC_CMD_EXPECTED_OUTPUT}    @{varargs}    &{kwargs}
+    Should StackQL Exec Inline Contain
+    ...    ${STACKQL_EXE}
+    ...    ${OKTA_SECRET_STR}
+    ...    ${GITHUB_SECRET_STR}
+    ...    ${K8S_SECRET_STR}
+    ...    ${REGISTRY_NULL}
+    ...    ${EMPTY}
+    ...    ${SQL_BACKEND_CFG_STR_CANONICAL}
+    ...    ${_EXEC_CMD_STR}
+    ...    ${_EXEC_CMD_EXPECTED_OUTPUT}
+    ...    &{kwargs}
+
+

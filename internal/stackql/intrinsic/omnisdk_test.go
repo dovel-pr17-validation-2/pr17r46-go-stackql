@@ -1,0 +1,397 @@
+package intrinsic //nolint:testpackage // tests unexported rowStream and pickMethod
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/lib/pq/oid"
+	"github.com/stackql-labs/omnisdk/pkg/omnisdk"
+	"github.com/stackql/psql-wire/pkg/sqldata"
+	"github.com/stackql/stackql/internal/stackql/internal_data_transfer/internaldto"
+	"github.com/stackql/stackql/internal/stackql/output"
+	dto "github.com/stackql/stackql/internal/stackql/runtimeconfig"
+)
+
+type fakeRows struct {
+	rows   []omnisdk.Row
+	idx    int
+	err    error
+	closed bool
+}
+
+func (f *fakeRows) Next() bool {
+	if f.idx < len(f.rows) {
+		f.idx++
+		return true
+	}
+	return false
+}
+
+func (f *fakeRows) Row() omnisdk.Row { return f.rows[f.idx-1] }
+func (f *fakeRows) Err() error       { return f.err }
+func (f *fakeRows) Close() error     { f.closed = true; return nil }
+
+type fakeColumnFactory struct{}
+
+func (fakeColumnFactory) GetPlaceholderColumn(
+	table sqldata.ISQLTable, colName string, colOID oid.Oid) sqldata.ISQLColumn {
+	return sqldata.NewSQLColumn(table, colName, 0, uint32(colOID), 1024, 0, "TextFormat")
+}
+
+func newTestStream(rows []omnisdk.Row, columnNames []string) (*rowStream, *fakeRows) {
+	cursor := &fakeRows{rows: rows}
+	cols := make([]column, 0, len(columnNames))
+	for _, name := range columnNames {
+		cols = append(cols, column{name: name})
+	}
+	return &rowStream{
+		rows:    cursor,
+		columns: cols,
+		table:   sqldata.NewSQLTable(0, "t"),
+		typCfg:  fakeColumnFactory{},
+	}, cursor
+}
+
+func drain(t *testing.T, stream *rowStream) [][]interface{} {
+	t.Helper()
+	var out [][]interface{}
+	for {
+		res, err := stream.Read()
+		if res == nil {
+			t.Fatalf("nil result alongside err %v", err)
+		}
+		for _, row := range res.GetRows() {
+			out = append(out, row.GetRowDataNaive())
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return out
+			}
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+}
+
+func TestRowStreamEmitsRowsInColumnOrder(t *testing.T) {
+	rows := []omnisdk.Row{
+		{"b": "b1", "a": "a1"},
+		{"b": "b2", "a": "a2"},
+	}
+	stream, cursor := newTestStream(rows, []string{"a", "b"})
+	got := drain(t, stream)
+	want := [][]interface{}{{"a1", "b1"}, {"a2", "b2"}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if !cursor.closed {
+		t.Fatal("underlying cursor was not closed")
+	}
+}
+
+func TestRowStreamDrainsEntireCursor(t *testing.T) {
+	total := 200
+	rows := make([]omnisdk.Row, 0, total)
+	for i := 0; i < total; i++ {
+		rows = append(rows, omnisdk.Row{"a": fmt.Sprintf("v%d", i)})
+	}
+	stream, _ := newTestStream(rows, []string{"a"})
+	got := drain(t, stream)
+	if len(got) != total {
+		t.Fatalf("read %d rows, want %d", len(got), total)
+	}
+}
+
+func TestRowStreamDerivesColumnsFromFirstRow(t *testing.T) {
+	stream, _ := newTestStream([]omnisdk.Row{{"zeta": "z", "alpha": "a"}}, nil)
+	got := drain(t, stream)
+	want := [][]interface{}{{"a", "z"}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestRowStreamPropagatesCursorError(t *testing.T) {
+	cursor := &fakeRows{err: errors.New("upstream failed")}
+	stream := &rowStream{
+		rows:   cursor,
+		table:  sqldata.NewSQLTable(0, "t"),
+		typCfg: fakeColumnFactory{},
+	}
+	_, err := stream.Read()
+	if err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("want upstream error, got %v", err)
+	}
+}
+
+func TestPickMethodDisambiguates(t *testing.T) {
+	if _, err := pickMethod("aws.s3.buckets", map[string]string{"region": "us-east-1"}); err == nil {
+		t.Fatal("want ambiguity error, got nil")
+	}
+	method, err := pickMethod("aws.s3.buckets", map[string]string{
+		"region": "us-east-1", methodPredicate: "enumerate"})
+	if err != nil {
+		t.Fatalf("explicit method: %v", err)
+	}
+	if method.Path != "aws.s3.buckets.enumerate" {
+		t.Fatalf("got %s", method.Path)
+	}
+}
+
+func TestPickMethodReportsMissingParams(t *testing.T) {
+	if _, err := pickMethod("aws.s3.buckets", map[string]string{}); err == nil {
+		t.Fatal("want missing-parameter error, got nil")
+	}
+}
+
+func TestBooleanValuesRenderLikeOtherProviders(t *testing.T) {
+	stream, _ := newTestStream(
+		[]omnisdk.Row{{"name": "b1", "public": false, "versioning": true}}, nil)
+	stream.columns = []column{
+		{name: "name", dataType: "string"},
+		{name: "public", dataType: "boolean"},
+		{name: "versioning", dataType: "boolean"},
+	}
+	var buf, errBuf bytes.Buffer
+	writer, err := output.GetOutputWriter(&buf, &errBuf, internaldto.OutputContext{
+		RuntimeContext: dto.RuntimeCtx{OutputFormat: "csv", Delimiter: ","},
+		Result:         stream,
+	})
+	if err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	if writeErr := writer.Write(stream); writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
+	}
+	want := "name,public,versioning\nb1,false,true\n"
+	if buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
+	}
+}
+
+func TestReportedTypeUsesStackqlVocabulary(t *testing.T) {
+	for _, tc := range []struct{ declared, want string }{
+		{"boolean", "bool"},
+		{"string", "string"},
+		{"integer", "integer"},
+		{"", "text"},
+	} {
+		if got := (column{dataType: tc.declared}).reportedType(); got != tc.want {
+			t.Errorf("declared %q: got %q, want %q", tc.declared, got, tc.want)
+		}
+	}
+}
+
+// pagedRows serves a first page, then blocks until released, then a second.
+// It models an upstream whose next page is slow to arrive.
+type pagedRows struct {
+	first    []omnisdk.Row
+	second   []omnisdk.Row
+	release  chan struct{}
+	idx      int
+	released bool
+}
+
+func (p *pagedRows) Next() bool {
+	if p.idx < len(p.first) {
+		p.idx++
+		return true
+	}
+	if !p.released {
+		<-p.release
+		p.released = true
+	}
+	if p.idx < len(p.first)+len(p.second) {
+		p.idx++
+		return true
+	}
+	return false
+}
+
+func (p *pagedRows) Row() omnisdk.Row {
+	if p.idx <= len(p.first) {
+		return p.first[p.idx-1]
+	}
+	return p.second[p.idx-len(p.first)-1]
+}
+
+func (p *pagedRows) Err() error   { return nil }
+func (p *pagedRows) Close() error { return nil }
+
+// The first page must reach the output writer before the second page is even
+// available upstream. Anything that buffers the whole cursor fails this.
+func TestRowsReachOutputBeforeNextPage(t *testing.T) {
+	first := []omnisdk.Row{{"a": "p1-r1"}, {"a": "p1-r2"}, {"a": "p1-r3"}}
+	second := []omnisdk.Row{{"a": "p2-r1"}}
+	cursor := &pagedRows{first: first, second: second, release: make(chan struct{})}
+	stream := &rowStream{
+		rows:      cursor,
+		batchSize: 1,
+		columns:   []column{{name: "a"}},
+		table:     sqldata.NewSQLTable(0, "t"),
+		typCfg:    fakeColumnFactory{},
+	}
+
+	var mu sync.Mutex
+	var written []string
+	sink := writerFunc(func(b []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		written = append(written, string(b))
+		return len(b), nil
+	})
+
+	var errBuf bytes.Buffer
+	writer, err := output.GetOutputWriter(sink, &errBuf, internaldto.OutputContext{
+		RuntimeContext: dto.RuntimeCtx{OutputFormat: "jsonl", Delimiter: ","},
+		Result:         stream,
+	})
+	if err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- writer.Write(stream) }()
+
+	// The whole first page must be written while the cursor is still stalled.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		count := len(written)
+		mu.Unlock()
+		if count >= len(first) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d rows reached the writer before the next page; rows are being buffered", count)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	beforeRelease := strings.Join(written, "")
+	mu.Unlock()
+	if strings.Contains(beforeRelease, "p2-r1") {
+		t.Fatal("second page appeared before it was released")
+	}
+	for _, want := range []string{"p1-r1", "p1-r2", "p1-r3"} {
+		if !strings.Contains(beforeRelease, want) {
+			t.Fatalf("row %s did not reach the writer before the next page: %q", want, beforeRelease)
+		}
+	}
+
+	close(cursor.release)
+	if writeErr := <-done; writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
+	}
+	mu.Lock()
+	all := strings.Join(written, "")
+	mu.Unlock()
+	if !strings.Contains(all, "p2-r1") {
+		t.Fatalf("second page missing from output: %q", all)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
+
+func TestOmnisdkAuthAPIKeyDefaultsMatchCanonicalProviders(t *testing.T) {
+	for _, tc := range []struct {
+		in         dto.AuthCtx
+		wantName   string
+		wantPrefix string
+	}{
+		{in: dto.AuthCtx{AuthConfig: omnisdk.AuthConfig{Type: "api_key", ValuePrefix: "token "}}, wantName: "Authorization", wantPrefix: "token "},
+		{in: dto.AuthCtx{AuthConfig: omnisdk.AuthConfig{Type: "api_key"}}, wantName: "Authorization", wantPrefix: "Bearer "},
+		{in: dto.AuthCtx{AuthConfig: omnisdk.AuthConfig{Type: "api_key", Name: "X-Api-Key"}}, wantName: "X-Api-Key", wantPrefix: ""},
+		{in: dto.AuthCtx{AuthConfig: omnisdk.AuthConfig{Type: "bearer"}}, wantName: "", wantPrefix: ""},
+	} {
+		authCtx := tc.in
+		got := omnisdkAuth(&authCtx)
+		if got.Name != tc.wantName || got.ValuePrefix != tc.wantPrefix {
+			t.Errorf("%+v: got name %q prefix %q, want %q %q",
+				tc.in, got.Name, got.ValuePrefix, tc.wantName, tc.wantPrefix)
+		}
+	}
+}
+
+func TestNullValuesRenderLikeBackendResults(t *testing.T) {
+	stream, _ := newTestStream([]omnisdk.Row{{"name": "explicit", "value": nil}, {"name": "absent"}}, nil)
+	stream.columns = []column{{name: "name", dataType: "string"}, {name: "value", dataType: "string"}}
+	var buf, errBuf bytes.Buffer
+	writer, err := output.GetOutputWriter(&buf, &errBuf, internaldto.OutputContext{
+		RuntimeContext: dto.RuntimeCtx{OutputFormat: "csv", Delimiter: ","}, Result: stream,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Write(stream); err != nil {
+		t.Fatal(err)
+	}
+	if want := "name,value\nexplicit,null\nabsent,null\n"; buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
+	}
+}
+
+func TestNullValuesRemainJSONNull(t *testing.T) {
+	stream, _ := newTestStream([]omnisdk.Row{{"name": "explicit", "value": nil}}, nil)
+	stream.columns = []column{{name: "name", dataType: "string"}, {name: "value", dataType: "string"}}
+	var buf, errBuf bytes.Buffer
+	writer, err := output.GetOutputWriter(&buf, &errBuf, internaldto.OutputContext{
+		RuntimeContext: dto.RuntimeCtx{OutputFormat: "jsonl"}, Result: stream,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Write(stream); err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"name":"explicit","value":null}` + "\n"; buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
+	}
+}
+
+func TestPrimedStreamPreservesRowsAndHeadersBeforeTerminalError(t *testing.T) {
+	original := errors.New("upstream failed")
+	for _, rows := range [][]omnisdk.Row{nil, {{"name": "kept"}}} {
+		stream, cursor := newTestStream(rows, []string{"name"})
+		cursor.err = original
+		primed, err := newPrimedStream(stream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, err := primed.Read()
+		if err != nil || len(first.GetRows()) != len(rows) || len(first.GetColumns()) != 1 {
+			t.Fatalf("rows=%v result=%v error=%v", rows, first, err)
+		}
+		_, err = primed.Read()
+		if !errors.Is(err, original) {
+			t.Fatalf("lost original error: %v", err)
+		}
+		if err = primed.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if !cursor.closed {
+			t.Fatal("cursor not closed")
+		}
+	}
+}
+
+func TestEmptyStagedSourceRetainsTerminalErrorForPresentation(t *testing.T) {
+	original := errors.New("first page failed")
+	source := newOmniBatchSource(&fakeRows{err: original}, []string{"name"}, 10)
+	batch, err := source.Next(context.Background())
+	if len(batch) != 0 || !errors.Is(err, io.EOF) || !errors.Is(source.terminalErr, original) {
+		t.Fatalf("batch=%v error=%v terminal=%v", batch, err, source.terminalErr)
+	}
+}

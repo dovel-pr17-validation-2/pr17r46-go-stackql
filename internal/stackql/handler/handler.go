@@ -1,0 +1,826 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/stackql-labs/omnisdk/public/authorization"
+	"github.com/stackql/stackql/internal/stackql/accessmanagement"
+
+	"github.com/stackql-labs/omnisdk/pkg/omnisdk"
+	"github.com/stackql/stackql/internal/stackql/acid/tsm"
+	"github.com/stackql/stackql/internal/stackql/acid/txn_context"
+	"github.com/stackql/stackql/internal/stackql/bundle"
+	"github.com/stackql/stackql/internal/stackql/constants"
+	"github.com/stackql/stackql/internal/stackql/datasource/sql_datasource"
+	"github.com/stackql/stackql/internal/stackql/dbmsinternal"
+	"github.com/stackql/stackql/internal/stackql/drm"
+	"github.com/stackql/stackql/internal/stackql/garbagecollector"
+	"github.com/stackql/stackql/internal/stackql/intrinsic"
+	"github.com/stackql/stackql/internal/stackql/jsonpath"
+	"github.com/stackql/stackql/internal/stackql/kstore"
+	"github.com/stackql/stackql/internal/stackql/netutils"
+	"github.com/stackql/stackql/internal/stackql/nomenclature"
+	"github.com/stackql/stackql/internal/stackql/provider"
+	"github.com/stackql/stackql/internal/stackql/registry"
+	dto "github.com/stackql/stackql/internal/stackql/runtimeconfig"
+	"github.com/stackql/stackql/internal/stackql/sql_system"
+	"github.com/stackql/stackql/internal/stackql/sqlengine"
+	"github.com/stackql/stackql/internal/stackql/tablenamespace"
+	"github.com/stackql/stackql/internal/stackql/typing"
+	"github.com/stackql/stackql/internal/stackql/writer"
+	"github.com/stackql/stackql/pkg/txncounter"
+
+	lrucache "github.com/stackql/stackql-parser/go/cache"
+	"github.com/stackql/stackql-parser/go/vt/sqlparser"
+	"gopkg.in/yaml.v2"
+)
+
+// ErrSessionConfiguration identifies a rejected session mutation at CLI boundaries.
+var ErrSessionConfiguration = errors.New("session configuration failed")
+
+var (
+	_ HandlerContext = &standardHandlerContext{}
+)
+
+type HandlerContext interface { //nolint:revive // don't mind stuttering this one
+	Clone() HandlerContext
+	NewClientContext() HandlerContext
+	GetExecutionContext() context.Context
+	SetExecutionContext(context.Context)
+	GetAccessManager() accessmanagement.Manager
+	GetCaller() authorization.Session
+	SetCaller(authorization.Session)
+	//
+	GetStacqklSemver() string
+	GetASTFormatter() sqlparser.NodeFormatter
+	GetAuthContext(providerName string) (*dto.AuthCtx, error)
+	InvalidateAuthContexts(providerName string)
+	GetDBMSInternalRouter() dbmsinternal.Router
+	GetProvider(providerName string) (provider.IProvider, error)
+	DeleteProvider(providerName string) error
+	GetSupportedProviders(extended bool) (map[string]map[string]interface{}, error)
+	LogHTTPResponseMap(target interface{})
+	//
+	GetRawQuery() string
+	GetQuery() string
+	GetQueryStartTime() time.Time
+	GetRuntimeContext() dto.RuntimeCtx
+	GetProviders() map[string]provider.IProvider
+
+	GetCurrentProvider() string
+	GetAuthContexts() dto.AuthContexts
+	GetRegistry() registry.RegistryAPI
+	GetErrorPresentation() string
+	GetOutfile() io.Writer
+	GetOutErrFile() io.Writer
+	GetLRUCache() *lrucache.LRUCache
+	GetSQLDataSource(name string) (sql_datasource.SQLDataSource, bool)
+	GetSQLEngine() sqlengine.SQLEngine
+	GetSQLSystem() sql_system.SQLSystem
+	GetGarbageCollector() garbagecollector.GarbageCollector
+	GetDrmConfig() drm.Config
+	SetTxnCounterMgr(txncounter.Manager)
+	GetTxnCounterMgr() txncounter.Manager
+	GetTxnStore() kstore.KStore
+	GetNamespaceCollection() tablenamespace.Collection
+	GetFormatter() sqlparser.NodeFormatter
+	GetPGInternalRouter() dbmsinternal.Router
+	//
+	SetCurrentProvider(string)
+	SetQuery(string)
+	SetRawQuery(string)
+	SetQueryStartTime(time.Time)
+	//
+	SetOutErrFile(io.Writer)
+	//
+	GetTxnCoordinatorCtx() txn_context.ITransactionCoordinatorContext
+
+	GetTypingConfig() typing.Config
+	GetIsolationLevel() constants.IsolationLevel
+	UpdateIsolationLevel(isolationLevelStr string) error
+
+	GetRollbackType() constants.RollbackType
+	UpdateRollbackType(rollbackTypeStr string) error
+
+	GetTSM() (tsm.TSM, bool)
+	SetTSM(tsm.TSM)
+
+	SetExportNamespace(string)
+	GetExportNamespace() string
+
+	GetDataFlowCfg() dto.DataFlowCfg
+
+	//
+	ResolveVariables(sqlparser.Statement) error
+	SetConfigAtPath(path string, rhs interface{}, scope string) error
+
+	// Upstream (provider HTTP) error strictness.  When true, data
+	// acquisition failures (eg HTTP 4xx / 5xx on a SELECT) surface as
+	// statement errors rather than empty result sets.  Off by default to
+	// preserve historical CLI / pgsrv semantics; the MCP server turns it
+	// on (issue #670).
+	IsStrictUpstreamErrors() bool
+	SetStrictUpstreamErrors(bool)
+
+	// for testing only
+	SetDefaultHTTPClient(client *http.Client)
+}
+
+type standardHandlerContext struct {
+	executionContext context.Context
+	accessManager    accessmanagement.Manager
+	caller           authorization.Session
+	// mutex to protect auth context map
+	// must be a pointer dure to clonability
+	providerSession     *providerSessionState
+	authMapMutex        *sync.Mutex
+	sessionCtxMutex     *sync.Mutex
+	providersMapMutex   *sync.Mutex
+	rawQuery            string
+	query               string
+	queryStartTime      time.Time
+	runtimeContext      dto.RuntimeCtx
+	providers           map[string]provider.IProvider
+	currentProvider     string
+	authContexts        dto.AuthContexts
+	docAuthProviders    map[string]struct{}
+	sqlDataSources      map[string]sql_datasource.SQLDataSource
+	registry            registry.RegistryAPI
+	errorPresentation   string
+	outfile             io.Writer
+	outErrFile          io.Writer
+	lRUCache            *lrucache.LRUCache
+	sqlEngine           sqlengine.SQLEngine
+	sqlSystem           sql_system.SQLSystem
+	garbageCollector    garbagecollector.GarbageCollector
+	drmConfig           drm.Config
+	txnCounterMgr       txncounter.Manager
+	txnStore            kstore.KStore
+	namespaceCollection tablenamespace.Collection
+	formatter           sqlparser.NodeFormatter
+	pgInternalRouter    dbmsinternal.Router
+	txnCoordinatorCtx   txn_context.ITransactionCoordinatorContext
+	typCfg              typing.Config
+	sessionContext      dto.SessionContext
+	walInstance         tsm.TSM
+	exportNamespace     string
+	stackqlSemver       string
+	defaultHTTPClient   *http.Client
+	// strictUpstreamErrors is documented on the HandlerContext interface.
+	strictUpstreamErrors bool
+}
+
+// for testing only.
+func (hc *standardHandlerContext) SetDefaultHTTPClient(client *http.Client) {
+	hc.defaultHTTPClient = client
+}
+
+func (hc *standardHandlerContext) IsStrictUpstreamErrors() bool {
+	return hc.strictUpstreamErrors
+}
+
+func (hc *standardHandlerContext) SetStrictUpstreamErrors(isStrict bool) {
+	hc.strictUpstreamErrors = isStrict
+}
+
+func (hc *standardHandlerContext) GetDataFlowCfg() dto.DataFlowCfg {
+	return dto.NewDataFlowCfg(
+		hc.runtimeContext.DataflowDependencyMax,
+		hc.runtimeContext.DataflowComponentsMax,
+	)
+}
+
+func (hc *standardHandlerContext) GetStacqklSemver() string {
+	return hc.stackqlSemver
+}
+
+func (hc *standardHandlerContext) SetExportNamespace(exportNamespace string) {
+	hc.exportNamespace = exportNamespace
+}
+
+func (hc *standardHandlerContext) GetExportNamespace() string {
+	return hc.exportNamespace
+}
+
+func (hc *standardHandlerContext) GetTSM() (tsm.TSM, bool) {
+	return hc.walInstance, hc.walInstance != nil
+}
+
+func (hc *standardHandlerContext) SetTSM(w tsm.TSM) {
+	hc.walInstance = w
+}
+
+func (hc *standardHandlerContext) GetTxnCoordinatorCtx() txn_context.ITransactionCoordinatorContext {
+	return hc.txnCoordinatorCtx
+}
+
+func (hc *standardHandlerContext) GetTypingConfig() typing.Config {
+	return hc.typCfg
+}
+
+func (hc *standardHandlerContext) SetCurrentProvider(p string) {
+	hc.currentProvider = p
+}
+
+func (hc *standardHandlerContext) SetRawQuery(rq string) {
+	hc.rawQuery = rq
+}
+
+func (hc *standardHandlerContext) SetQueryStartTime(t time.Time) {
+	hc.queryStartTime = t
+}
+
+func (hc *standardHandlerContext) SetQuery(q string) {
+	hc.query = q
+}
+
+func (hc *standardHandlerContext) SetTxnCounterMgr(mgr txncounter.Manager) {
+	hc.txnCounterMgr = mgr
+}
+
+func (hc *standardHandlerContext) GetRawQuery() string                         { return hc.rawQuery }
+func (hc *standardHandlerContext) GetQueryStartTime() time.Time                { return hc.queryStartTime }
+func (hc *standardHandlerContext) GetQuery() string                            { return hc.query }
+func (hc *standardHandlerContext) GetRuntimeContext() dto.RuntimeCtx           { return hc.runtimeContext }
+func (hc *standardHandlerContext) GetProviders() map[string]provider.IProvider { return hc.providers }
+func (hc *standardHandlerContext) GetCurrentProvider() string                  { return hc.currentProvider }
+
+func (hc *standardHandlerContext) GetAuthContexts() dto.AuthContexts {
+	hc.authMapMutex.Lock()
+	defer hc.authMapMutex.Unlock()
+	return hc.authContexts.Clone()
+}
+
+func (hc *standardHandlerContext) GetRegistry() registry.RegistryAPI { return hc.registry }
+func (hc *standardHandlerContext) GetErrorPresentation() string      { return hc.errorPresentation }
+func (hc *standardHandlerContext) GetOutfile() io.Writer             { return hc.outfile }
+func (hc *standardHandlerContext) GetOutErrFile() io.Writer {
+	defer hc.sessionCtxMutex.Unlock()
+	hc.sessionCtxMutex.Lock()
+	return hc.outErrFile
+}
+func (hc *standardHandlerContext) SetOutErrFile(w io.Writer) {
+	defer hc.sessionCtxMutex.Unlock()
+	hc.sessionCtxMutex.Lock()
+	hc.outErrFile = w
+}
+func (hc *standardHandlerContext) GetLRUCache() *lrucache.LRUCache    { return hc.lRUCache }
+func (hc *standardHandlerContext) GetSQLEngine() sqlengine.SQLEngine  { return hc.sqlEngine }
+func (hc *standardHandlerContext) GetSQLSystem() sql_system.SQLSystem { return hc.sqlSystem }
+
+func (hc *standardHandlerContext) GetGarbageCollector() garbagecollector.GarbageCollector {
+	return hc.garbageCollector
+}
+func (hc *standardHandlerContext) GetDrmConfig() drm.Config { return hc.drmConfig }
+func (hc *standardHandlerContext) GetTxnCounterMgr() txncounter.Manager {
+	return hc.txnCounterMgr
+}
+func (hc *standardHandlerContext) GetTxnStore() kstore.KStore { return hc.txnStore }
+
+//	func (hc *standardHandlerContext) GetNamespaceCollection() tablenamespace.Collection {
+//		return hc.namespaceCollection
+//	}
+func (hc *standardHandlerContext) GetFormatter() sqlparser.NodeFormatter { return hc.formatter }
+func (hc *standardHandlerContext) GetPGInternalRouter() dbmsinternal.Router {
+	return hc.pgInternalRouter
+}
+
+func getProviderMap(providerName string, providerDesc registry.ProviderDescription) map[string]interface{} {
+	latestVersion, err := registry.LatestVersion(providerDesc.Versions)
+	if err != nil {
+		//nolint:lll // long message
+		latestVersion = fmt.Sprintf("could not infer latest version due to error.  Suggested action is that you wipe the local provider directory.  Error =  '%s'", err.Error())
+	}
+	googleMap := map[string]interface{}{
+		"name":    providerName,
+		"version": latestVersion,
+	}
+	return googleMap
+}
+
+func getProviderMapExtended(
+	providerName string,
+	providerDesc registry.ProviderDescription,
+) map[string]interface{} {
+	return getProviderMap(providerName, providerDesc)
+}
+
+func (hc *standardHandlerContext) GetSQLDataSource(name string) (sql_datasource.SQLDataSource, bool) {
+	ac, ok := hc.sqlDataSources[name]
+	return ac, ok
+}
+
+func (hc *standardHandlerContext) GetSupportedProviders(extended bool) (map[string]map[string]interface{}, error) {
+	retVal := make(map[string]map[string]interface{})
+	provs := hc.registry.ListLocallyAvailableProviders()
+	retVal[intrinsic.ProviderName] = map[string]interface{}{
+		"name":    intrinsic.ProviderName,
+		"version": intrinsic.ProviderVersion,
+	}
+	// Supporting SQL data sources
+	// These will be overwritten by any documented providers with the same name
+	for k := range hc.sqlDataSources {
+		pn := k
+		retVal[pn] = map[string]interface{}{
+			"name": pn,
+		}
+	}
+	for k, pd := range provs {
+		pn := k
+		if pn == "googleapis.com" {
+			pn = "google"
+		}
+		if extended {
+			retVal[pn] = getProviderMapExtended(pn, pd)
+		} else {
+			retVal[pn] = getProviderMap(pn, pd)
+		}
+		// Every locally available bundle is also addressable document-first,
+		// once that has been opted into.
+		if intrinsic.IsExtendedCatalogEnabled() {
+			unstable := intrinsic.UnstablePrefix + pn
+			retVal[unstable] = map[string]interface{}{
+				"name":    unstable,
+				"version": intrinsic.ProviderVersion,
+			}
+		}
+	}
+	return retVal, nil
+}
+
+func (hc *standardHandlerContext) GetASTFormatter() sqlparser.NodeFormatter {
+	return hc.formatter
+}
+
+func (hc *standardHandlerContext) DeleteProvider(providerName string) error {
+	hc.providersMapMutex.Lock()
+	defer hc.providersMapMutex.Unlock()
+	if providerName == "googleapis.com" {
+		providerName = "google"
+	}
+	if providerName == "" {
+		return fmt.Errorf("provider name cannot be empty")
+	}
+	_, ok := hc.providers[providerName]
+	if len(hc.providers) == 0 || !ok {
+		return fmt.Errorf("provider '%s' not found", providerName)
+	}
+	delete(hc.providers, providerName)
+	return nil
+}
+
+func (hc *standardHandlerContext) GetProvider(providerName string) (provider.IProvider, error) {
+	var err error
+	if providerName == "" {
+		providerName = hc.runtimeContext.ProviderStr
+	}
+	if hc.namespaceCollection.GetAnalyticsCacheTableNamespaceConfigurator().IsAllowed(providerName) {
+		providerName = hc.namespaceCollection.GetAnalyticsCacheTableNamespaceConfigurator().GetObjectName(providerName)
+	}
+	ds, err := nomenclature.ExtractProviderDesignation(providerName)
+	if err != nil {
+		return nil, err
+	}
+	// NOTE: this method **must** be the only place the providers map is accessed or mutated
+	hc.providersMapMutex.Lock()
+	defer hc.providersMapMutex.Unlock()
+	prov, ok := hc.providers[providerName]
+	//nolint:nestif // TODO: review
+	if !ok {
+		prov, err = provider.GenerateProvider(
+			hc.runtimeContext, ds.Name, ds.Tag,
+			hc.registry, hc.sqlSystem,
+		)
+		if err == nil {
+			hc.providers[providerName] = prov
+			if ds.Name == intrinsic.ProviderName {
+				return prov, nil
+			}
+			// update auth info with provider default if auth not already present
+			pr, prErr := prov.GetProvider()
+			if prErr != nil {
+				return prov, prErr
+			}
+			authDTO, exists := pr.GetAuth()
+			if exists {
+				auth := transformOpenapiStackqlAuthToLocal(authDTO)
+				hc.updateAuthContextIfNotExists(providerName, auth)
+			}
+			return prov, nil
+		}
+		err = fmt.Errorf("cannot find provider = '%s': %w", providerName, err)
+	}
+	return prov, err
+}
+
+func (hc *standardHandlerContext) LogHTTPResponseMap(target interface{}) {
+	if target == nil {
+		//nolint:errcheck // ignore error on output stream
+		hc.outErrFile.Write(
+			[]byte("processed http response body not present\n"))
+		return
+	}
+	//nolint:nestif // ignore nested if
+	if hc.runtimeContext.HTTPLogEnabled {
+		switch target := target.(type) {
+		case []map[string]interface{}, map[string]interface{}, []interface{}:
+			b, err := json.MarshalIndent(target, "", "  ")
+			if err != nil {
+				//nolint:errcheck // ignore error on output stream
+				hc.outErrFile.Write(
+					[]byte(
+						fmt.Sprintf(
+							"processed http response body map '%v' colud not be marshalled; error: %s\n",
+							target, err.Error())))
+				return
+			}
+			if target != nil { //nolint:govet // TODO: review
+				//nolint:errcheck // ignore error on output stream
+				hc.outErrFile.Write(
+					[]byte(fmt.Sprintf("processed http response body object: %s\n", string(b))))
+			} else {
+				//nolint:errcheck // ignore error on output stream
+				hc.outErrFile.Write(
+					[]byte("processed http response body not present\n"))
+			}
+		default:
+			if target != nil { //nolint:govet // TODO: review
+				//nolint:errcheck // ignore error on output stream
+				hc.outErrFile.Write(
+					[]byte(
+						fmt.Sprintf("processed http response body object: %v\n", target)))
+			} else {
+				//nolint:errcheck // ignore error on output stream
+				hc.outErrFile.Write(
+					[]byte("processed http response body not present\n"))
+			}
+		}
+	}
+}
+
+func (hc *standardHandlerContext) GetAuthContext(providerName string) (*dto.AuthCtx, error) {
+	if providerName == "" {
+		providerName = hc.runtimeContext.ProviderStr
+	}
+	hc.authMapMutex.Lock()
+	authCtx, ok := hc.authContexts[providerName]
+	if ok {
+		authCtx = authCtx.Clone()
+	}
+	hc.authMapMutex.Unlock()
+	if ok {
+		return authCtx, nil
+	}
+	// Load only registration defaults. Authentication itself belongs to Omni.
+	if _, err := hc.GetProvider(providerName); err != nil {
+		return nil, err
+	}
+	hc.authMapMutex.Lock()
+	defer hc.authMapMutex.Unlock()
+	if authCtx, ok = hc.authContexts[providerName]; ok {
+		return authCtx.Clone(), nil
+	}
+	return nil, fmt.Errorf("cannot find AUTH context for provider = '%s'", providerName)
+}
+
+func (hc *standardHandlerContext) UpdateIsolationLevel(isolationLevelStr string) error {
+	hc.sessionCtxMutex.Lock()
+	defer hc.sessionCtxMutex.Unlock()
+	return hc.sessionContext.UpdateIsolationLevel(isolationLevelStr)
+}
+
+func (hc *standardHandlerContext) GetIsolationLevel() constants.IsolationLevel {
+	hc.sessionCtxMutex.Lock()
+	defer hc.sessionCtxMutex.Unlock()
+	return hc.sessionContext.GetIsolationLevel()
+}
+
+func (hc *standardHandlerContext) UpdateRollbackType(rollbackTypeStr string) error {
+	hc.sessionCtxMutex.Lock()
+	defer hc.sessionCtxMutex.Unlock()
+	return hc.sessionContext.UpdateIsolationLevel(rollbackTypeStr)
+}
+
+func (hc *standardHandlerContext) GetRollbackType() constants.RollbackType {
+	hc.sessionCtxMutex.Lock()
+	defer hc.sessionCtxMutex.Unlock()
+	return hc.sessionContext.GetRollbackType()
+}
+
+func (hc *standardHandlerContext) updateAuthContextIfNotExists(providerName string, authCtx *dto.AuthCtx) {
+	hc.authMapMutex.Lock()
+	defer hc.authMapMutex.Unlock()
+	_, alreadyExists := hc.authContexts[providerName]
+	if alreadyExists {
+		return
+	}
+	hc.authContexts[providerName] = authCtx
+	hc.docAuthProviders[providerName] = struct{}{}
+}
+
+// InvalidateAuthContexts drops auth contexts registered lazily from provider
+// documents (all of them when providerName is empty), together with the
+// cached provider objects that registered them, so the next GetProvider call
+// rebuilds both; contexts supplied at startup via --auth are retained.
+func (hc *standardHandlerContext) InvalidateAuthContexts(providerName string) {
+	hc.providersMapMutex.Lock()
+	defer hc.providersMapMutex.Unlock()
+	hc.authMapMutex.Lock()
+	defer hc.authMapMutex.Unlock()
+	for name := range hc.docAuthProviders {
+		if providerName != "" && name != providerName {
+			continue
+		}
+		delete(hc.providers, name)
+		delete(hc.authContexts, name)
+		delete(hc.docAuthProviders, name)
+	}
+}
+
+func (hc *standardHandlerContext) SetConfigAtPath(path string, rhs interface{}, scope string) error {
+	if hc.runtimeContext.AccessConfigFile != "" {
+		if err := authorization.Check(hc.GetExecutionContext(), "session/config", "write"); err != nil {
+			return err
+		}
+	}
+	if scope != "" && scope != "session" {
+		return fmt.Errorf("configuration scope %q is not supported; use SESSION", scope)
+	}
+	if hc.lRUCache != nil {
+		hc.lRUCache.Clear()
+	}
+	if strings.HasPrefix(path, "variables.") {
+		return hc.setSessionVariable(path, rhs)
+	}
+	if handled, err := hc.setProviderSessionConfig(path, rhs, scope); handled {
+		return err
+	}
+	return hc.setConfigAtPath(path, rhs, scope)
+}
+
+func (hc *standardHandlerContext) setConfigAtPath(path string, rhs interface{}, scope string) error {
+	searchPath, searchPathErr := composeSystemSearchPath(path)
+	if searchPathErr != nil {
+		return searchPathErr
+	}
+	system := searchPath.GetSystem()
+	remainder := searchPath.GetRemainder()
+	switch system {
+	case dto.AuthCtxKey:
+		return hc.setAuthContextAtPath(remainder, rhs, scope)
+	default:
+		return fmt.Errorf("system '%s' not supported", system)
+	}
+}
+
+//nolint:nestif // Whole-object replacement and field reset intentionally have distinct semantics.
+func (hc *standardHandlerContext) setAuthContextAtPath(path string, rhs interface{}, scope string) error {
+	hc.authMapMutex.Lock()
+	defer hc.authMapMutex.Unlock()
+	parts, err := jsonpath.SplitSearchPath(path)
+	if err != nil {
+		return err
+	}
+	if len(parts) == 0 {
+		return fmt.Errorf("auth requires a provider")
+	}
+	candidate := hc.authContexts[parts[0]].Clone()
+	if candidate == nil {
+		candidate = &dto.AuthCtx{}
+	}
+	raw, err := json.Marshal(candidate)
+	if err != nil {
+		return err
+	}
+	var fields map[string]interface{}
+	if err = json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	if len(parts) == 1 {
+		if rhs == nil {
+			fields = map[string]interface{}{}
+		} else {
+			var ok bool
+			fields, ok = rhs.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("auth configuration must be an object")
+			}
+		}
+	} else {
+		if err = updateSessionField(fields, parts[1:], rhs); err != nil {
+			return err
+		}
+	}
+	var updated dto.AuthCtx
+	if err = decodeSessionObject(fields, &updated); err != nil {
+		return err
+	}
+	if scope == "local" {
+		hc.authContexts = hc.authContexts.Clone()
+	}
+	if hc.authContexts == nil {
+		hc.authContexts = dto.AuthContexts{}
+	}
+	hc.authContexts[parts[0]] = &updated
+	delete(hc.docAuthProviders, parts[0])
+	return nil
+}
+
+func (hc *standardHandlerContext) GetNamespaceCollection() tablenamespace.Collection {
+	return hc.namespaceCollection
+}
+
+func (hc *standardHandlerContext) GetDBMSInternalRouter() dbmsinternal.Router {
+	return hc.pgInternalRouter
+}
+
+func GetRegistry(runtimeCtx dto.RuntimeCtx) (registry.RegistryAPI, error) {
+	return getRegistry(runtimeCtx)
+}
+
+func getRegistry(runtimeCtx dto.RuntimeCtx) (registry.RegistryAPI, error) {
+	var rc omnisdk.RegistryConfig
+	err := yaml.Unmarshal([]byte(runtimeCtx.RegistryRaw), &rc)
+	if err != nil {
+		return nil, err
+	}
+	if rc.LocalDocRoot == "" {
+		if strings.HasPrefix(rc.RegistryURL, "file:") {
+			rc.LocalDocRoot = path.Clean(path.Join(strings.TrimPrefix(rc.RegistryURL, "file:"), ".."))
+		} else {
+			rc.LocalDocRoot = runtimeCtx.ApplicationFilesRootPath
+		}
+	}
+	rt := netutils.GetRoundTripper(runtimeCtx, nil)
+	return registry.NewRegistry(rc, rt)
+}
+
+func (hc *standardHandlerContext) Clone() HandlerContext {
+	hc.sessionCtxMutex.Lock()
+	defer hc.sessionCtxMutex.Unlock()
+	if hc.providerSession == nil {
+		hc.providerSession = newProviderSessionState(hc.runtimeContext.APIRequestTimeout, hc.runtimeContext.HTTPPageLimit)
+	}
+	rv := standardHandlerContext{
+		providerSession:  hc.providerSession,
+		executionContext: hc.executionContext, accessManager: hc.accessManager, caller: hc.caller,
+		authMapMutex:         hc.authMapMutex,
+		sessionCtxMutex:      hc.sessionCtxMutex,
+		providersMapMutex:    hc.providersMapMutex,
+		drmConfig:            hc.drmConfig,
+		rawQuery:             hc.rawQuery,
+		queryStartTime:       hc.queryStartTime,
+		runtimeContext:       hc.runtimeContext,
+		currentProvider:      hc.currentProvider,
+		providers:            hc.providers,
+		authContexts:         hc.authContexts,
+		docAuthProviders:     hc.docAuthProviders,
+		registry:             hc.registry,
+		errorPresentation:    hc.errorPresentation,
+		lRUCache:             hc.lRUCache,
+		sqlEngine:            hc.sqlEngine,
+		sqlDataSources:       hc.sqlDataSources,
+		sqlSystem:            hc.sqlSystem,
+		garbageCollector:     hc.garbageCollector,
+		outErrFile:           hc.outErrFile,
+		outfile:              hc.outfile,
+		txnCounterMgr:        hc.txnCounterMgr,
+		txnStore:             hc.txnStore,
+		namespaceCollection:  hc.namespaceCollection,
+		formatter:            hc.formatter,
+		pgInternalRouter:     hc.pgInternalRouter,
+		txnCoordinatorCtx:    hc.txnCoordinatorCtx,
+		typCfg:               hc.typCfg,
+		sessionContext:       hc.sessionContext,
+		exportNamespace:      hc.exportNamespace,
+		stackqlSemver:        hc.stackqlSemver,
+		defaultHTTPClient:    hc.defaultHTTPClient,
+		strictUpstreamErrors: hc.strictUpstreamErrors,
+	}
+	return &rv
+}
+
+func getOutputFile(filename string) (*os.File, error) {
+	switch filename {
+	case "stdout":
+		return os.Stdout, nil
+	case "stderr":
+		return os.Stderr, nil
+	default:
+		return os.Create(filename)
+	}
+}
+
+func NewHandlerCtx(
+	cmdString string,
+	runtimeCtx dto.RuntimeCtx,
+	lruCache *lrucache.LRUCache,
+	inputBundle bundle.Bundle,
+	stackqlSemver string,
+) (HandlerContext, error) {
+	accessManager, err := accessmanagement.NewManager(runtimeCtx.AccessConfigFile, inputBundle.GetSQLEngine())
+	if err != nil {
+		return nil, err
+	}
+	reg, err := getRegistry(runtimeCtx)
+	if err != nil {
+		return nil, err
+	}
+	providers := make(map[string]provider.IProvider)
+
+	sqlEngine := inputBundle.GetSQLEngine()
+	outWriter, isOutwriter := inputBundle.GetStdOut()
+	outErrWriter, isOutErrWriter := inputBundle.GetStdErr()
+	var fileErr error
+	if !isOutwriter {
+		outFilePath := runtimeCtx.OutfilePath
+		if outFilePath == "" {
+			outFilePath = "stdout"
+		}
+		outWriter, fileErr = getOutputFile(outFilePath)
+		if fileErr != nil {
+			return nil, fileErr
+		}
+	}
+	if !isOutErrWriter {
+		outErrPath := writer.StdErrStr
+		outErrWriter, fileErr = getOutputFile(outErrPath)
+		if fileErr != nil {
+			return nil, fileErr
+		}
+	}
+	rv := standardHandlerContext{
+		authMapMutex:        &sync.Mutex{},
+		sessionCtxMutex:     &sync.Mutex{},
+		providersMapMutex:   &sync.Mutex{},
+		rawQuery:            cmdString,
+		runtimeContext:      runtimeCtx.Copy(),
+		providers:           providers,
+		authContexts:        inputBundle.GetAuthContexts(),
+		docAuthProviders:    map[string]struct{}{},
+		registry:            reg,
+		errorPresentation:   runtimeCtx.ErrorPresentation,
+		lRUCache:            lruCache,
+		sqlEngine:           sqlEngine,
+		sqlDataSources:      inputBundle.GetSQLDataSources(),
+		sqlSystem:           inputBundle.GetSQLSystem(),
+		garbageCollector:    inputBundle.GetGC(),
+		txnCounterMgr:       inputBundle.GetTxnCounterManager(),
+		txnStore:            inputBundle.GetTxnStore(),
+		namespaceCollection: inputBundle.GetNamespaceCollection(),
+		formatter:           inputBundle.GetSQLSystem().GetASTFormatter(),
+		pgInternalRouter:    inputBundle.GetDBMSInternalRouter(),
+		currentProvider:     runtimeCtx.ProviderStr,
+		txnCoordinatorCtx:   inputBundle.GetTxnCoordinatorContext(),
+		typCfg:              inputBundle.GetTypingConfig(),
+		sessionContext:      inputBundle.GetSessionContext(),
+		accessManager:       accessManager,
+		exportNamespace:     runtimeCtx.ExportAlias,
+		outfile:             outWriter,
+		outErrFile:          outErrWriter,
+		stackqlSemver:       stackqlSemver,
+	}
+	drmCfg, err := drm.GenerateDRMConfig(
+		inputBundle.GetSQLSystem(),
+		inputBundle.GetTypingConfig(),
+		rv.namespaceCollection,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rv.drmConfig = drmCfg
+	return &rv, nil
+}
+
+func transformOpenapiStackqlAuthToLocal(auth *omnisdk.ProviderAuth) *dto.AuthCtx {
+	if auth == nil {
+		return nil
+	}
+	cfg := auth.AuthConfig
+	// A runtime token URL bypasses the document's token URL variables; omnisdk overlays the document's own.
+	cfg.TokenURL = ""
+	return &dto.AuthCtx{AuthConfig: cfg, Successor: transformOpenapiStackqlAuthToLocal(auth.Successor)}
+}
+
+func (hc *standardHandlerContext) GetExecutionContext() context.Context {
+	if hc.executionContext == nil {
+		return context.Background()
+	}
+	return hc.executionContext
+}
+func (hc *standardHandlerContext) SetExecutionContext(ctx context.Context) { hc.executionContext = ctx }
+func (hc *standardHandlerContext) GetAccessManager() accessmanagement.Manager {
+	return hc.accessManager
+}
+func (hc *standardHandlerContext) GetCaller() authorization.Session       { return hc.caller }
+func (hc *standardHandlerContext) SetCaller(caller authorization.Session) { hc.caller = caller }

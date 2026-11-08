@@ -1,0 +1,464 @@
+# MCP bundle packaging: builds + smoke-tests the .mcpb bundles and OCI image
+# from packaging/mcpb.  Validation runs on packaging/** PRs; publishing is
+# MANUAL (workflow_dispatch) because the consumed release assets
+# (Authenticode-signed exe, notarised .pkg) are signed outside CI, so a
+# release event fires before they exist.  Flow:
+# push tag -> create release -> attach signed assets -> dispatch.
+# The npm wrapper is published by the npm-publish job (npm trusted publishing,
+# OIDC). The PyPI wrapper needs interactive (2FA) credentials and is published
+# from a local clone - see step 8 of docs/stackql_release_process.md.
+# The three embedded SDK wrappers (cargo, go, dotnet) are validated here on
+# every packaging PR (against the latest release, smoke tests fed the freshly
+# built bundle via STACKQL_MCP_BUNDLE) and, on dispatch, validated with real
+# downloads through releases.stackql.io and then published from repo secrets
+# / OIDC (see the sdk / *-publish jobs).
+# The MCP Registry entry is published LAST, via the separate
+# mcp-registry-publish workflow: the registry validates that the npm/PyPI/OCI
+# packages already exist at the exact version, so it cannot run from here.
+
+name: mcp-packaging
+
+on:
+  pull_request:
+    paths: ['packaging/**', '.github/workflows/mcp-packaging.yml']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: stackql release version without the leading v (e.g. 0.10.550); the release's signed assets must already be attached
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: packaging/mcpb
+
+jobs:
+  test:
+    name: packaging regressions (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          # October 2026 security release: TLS hostname CVEs, Brotli RCE, eMudhra CA removal
+          node-version: '24.22.1'
+          check-latest: true
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.13'
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: actions/setup-go@v7.0.0
+        if: runner.os == 'Windows'
+        with:
+          go-version: '1.27.3'
+      - run: npm ci --prefix npm
+      - run: python scripts/test-packaging.py
+
+  version:
+    name: resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      is_publish: ${{ steps.resolve.outputs.is_publish }}
+    steps:
+      - name: Resolve target release version
+        id: resolve
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="v${{ inputs.version }}"
+            echo "is_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            tag="$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+            echo "is_publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "resolved: $tag"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  bundle:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: darwin-universal
+            runner: macos-latest
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build bundle
+        run: make one TARGET=${{ matrix.target }} VERSION=${{ needs.version.outputs.version }}
+      - name: Smoke test (deterministic MCP handshake)
+        run: python3 scripts/smoke-test.py dist/stackql-mcp-${{ matrix.target }}.mcpb
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: stackql-mcp-${{ matrix.target }}
+          path: |
+            packaging/mcpb/dist/stackql-mcp-${{ matrix.target }}.mcpb
+            packaging/mcpb/dist/stackql-mcp-${{ matrix.target }}.mcpb.sha256
+          if-no-files-found: error
+
+  bundle-windows:
+    name: ${{ matrix.target }} (build)
+    needs: version
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [windows-x64, windows-arm64]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build bundle
+        run: make one TARGET=${{ matrix.target }} VERSION=${{ needs.version.outputs.version }}
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: stackql-mcp-${{ matrix.target }}
+          path: |
+            packaging/mcpb/dist/stackql-mcp-${{ matrix.target }}.mcpb
+            packaging/mcpb/dist/stackql-mcp-${{ matrix.target }}.mcpb.sha256
+          if-no-files-found: error
+
+  smoke-windows:
+    name: ${{ matrix.target }} (smoke)
+    needs: [version, bundle, bundle-windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: windows-x64, runner: windows-latest, arch: x64 }
+          - { target: windows-arm64, runner: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.13'
+          architecture: ${{ matrix.arch }}
+      - uses: actions/setup-node@v7
+        with:
+          # October 2026 security release: TLS hostname CVEs, Brotli RCE, eMudhra CA removal
+          node-version: '24.22.1'
+          check-latest: true
+          architecture: ${{ matrix.arch }}
+      - name: Download bundle artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: stackql-mcp-*
+          path: packaging/mcpb/dist
+          merge-multiple: true
+      - name: Smoke test (deterministic MCP handshake)
+        run: python scripts/smoke-test.py dist/stackql-mcp-${{ matrix.target }}.mcpb
+      - name: Render wrapper test manifests
+        shell: bash
+        env:
+          CHECKSUM_DIR: ${{ github.workspace }}/packaging/mcpb/dist
+        run: |
+          bash scripts/render-platforms.sh --version ${{ needs.version.outputs.version }} --vector npm
+          bash scripts/render-platforms.sh --version ${{ needs.version.outputs.version }} --vector pypi
+      - name: Install wrappers
+        run: |
+          npm ci --prefix npm
+          python -m pip install ./pypi
+      - name: Smoke test npm and PyPI launchers
+        env:
+          STACKQL_MCP_BUNDLE: ${{ github.workspace }}/packaging/mcpb/dist/stackql-mcp-${{ matrix.target }}.mcpb
+        run: |
+          python scripts/smoke-test.py --cmd "node npm/bin/stackql-mcp.js"
+          python scripts/smoke-test.py --cmd "stackql-mcp-server"
+
+  oci:
+    name: oci (build + smoke)
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build image
+        run: make oci VERSION=${{ needs.version.outputs.version }}
+      - name: Smoke test (deterministic MCP handshake)
+        run: python3 scripts/smoke-test.py --docker stackql/stackql-mcp:${{ needs.version.outputs.version }}
+
+  # Multiplatform bundle for single-artefact venues, built from the five
+  # per-platform bundle artifacts (byte-identical binaries); verify-combined.py
+  # asserts every binary's machine type.
+  combined:
+    name: multiplatform (combined build + byte verification)
+    needs: [version, bundle, bundle-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Gather per-platform bundle artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: stackql-mcp-*
+          path: packaging/mcpb/dist
+          merge-multiple: true
+      - name: Build combined bundle (hard-fails unless all five bundles present)
+        run: make combined VERSION=${{ needs.version.outputs.version }}
+      - name: Upload combined bundle artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: stackql-mcp-multiplatform
+          path: |
+            packaging/mcpb/dist/stackql-mcp-multiplatform.mcpb
+            packaging/mcpb/dist/stackql-mcp-multiplatform.mcpb.sha256
+          if-no-files-found: error
+
+  # Install-and-handshake the combined bundle on every host OS (arm64 linux
+  # leg covers the arch shim): each host must select its own binary via
+  # platform_overrides and complete the MCP handshake.
+  combined-smoke:
+    name: multiplatform smoke (${{ matrix.runner }})
+    needs: combined
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            py: python3
+          - runner: ubuntu-24.04-arm
+            py: python3
+          - runner: macos-latest
+            py: python3
+          - runner: windows-latest
+            py: python
+          - runner: windows-11-arm
+            py: python
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download combined bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: stackql-mcp-multiplatform
+          path: packaging/mcpb/dist
+      - name: Smoke test (platform_overrides selection + MCP handshake)
+        run: ${{ matrix.py }} scripts/smoke-test.py dist/stackql-mcp-multiplatform.mcpb
+
+  publish:
+    name: upload bundles to release
+    if: needs.version.outputs.is_publish == 'true'
+    needs: [version, test, bundle, bundle-windows, smoke-windows, oci, combined, combined-smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Gather bundle artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: stackql-mcp-*
+          path: packaging/mcpb/dist
+          merge-multiple: true
+      - name: Envelope-sign bundles (when signing material configured)
+        env:
+          MCPB_SIGNING_CERT: ${{ secrets.MCPB_SIGNING_CERT }}
+          MCPB_SIGNING_KEY: ${{ secrets.MCPB_SIGNING_KEY }}
+          MCPB_SIGNING_INTERMEDIATES: ${{ secrets.MCPB_SIGNING_INTERMEDIATES }}
+        run: |
+          if [ -n "$MCPB_SIGNING_CERT" ] && [ -n "$MCPB_SIGNING_KEY" ]; then
+            make sign
+          else
+            echo "signing material not configured; publishing unsigned bundles"
+          fi
+      - name: Upload to release (same repo - GITHUB_TOKEN suffices)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: make publish VERSION=${{ needs.version.outputs.version }}
+
+  oci-publish:
+    name: push OCI image
+    if: needs.version.outputs.is_publish == 'true'
+    needs: [version, oci]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Push multi-arch image
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          docker buildx create --use
+          make oci-push VERSION=${{ needs.version.outputs.version }}
+
+  # --- embedded SDK wrappers -------------------------------------------------
+  # One job per (vector, runner). Each: toolchain, render platforms.json for
+  # the version under test (needs the .mcpb.sha256 assets on the release, so
+  # on dispatch this runs after 'publish'), lint + unit tests + package, then
+  # scripts/smoke-test.py --cmd against the vector's launcher. On PRs the
+  # launcher extracts the bundle built by this run (STACKQL_MCP_BUNDLE, no
+  # network); on dispatch it downloads through releases.stackql.io and
+  # verifies the pin for real.
+  sdk:
+    name: sdk ${{ matrix.vector }} (${{ matrix.runner }})
+    needs: [version, test, bundle, bundle-windows, publish]
+    # 'publish' is skipped on PRs; run when it succeeded or was skipped.
+    if: >-
+      !cancelled()
+      && needs.test.result == 'success'
+      && needs.bundle.result == 'success'
+      && needs.bundle-windows.result == 'success'
+      && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { vector: cargo,  runner: ubuntu-24.04,  target: linux-x64,        py: python3 }
+          - { vector: cargo,  runner: windows-latest, target: windows-x64,      py: python }
+          - { vector: cargo,  runner: windows-11-arm, target: windows-arm64,    py: python }
+          - { vector: cargo,  runner: macos-latest,   target: darwin-universal, py: python3 }
+          - { vector: go,     runner: ubuntu-24.04,  target: linux-x64,        py: python3 }
+          - { vector: go,     runner: windows-latest, target: windows-x64,      py: python }
+          - { vector: go,     runner: windows-11-arm, target: windows-arm64,    py: python }
+          - { vector: dotnet, runner: ubuntu-24.04,  target: linux-x64,        py: python3 }
+          - { vector: dotnet, runner: windows-latest, target: windows-x64,      py: python }
+          - { vector: dotnet, runner: windows-11-arm, target: windows-arm64,    py: python }
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download this run's bundle (PR smoke input)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: stackql-mcp-*
+          path: packaging/mcpb/dist
+          merge-multiple: true
+      - name: Point the launcher at the local bundle on PRs
+        if: needs.version.outputs.is_publish != 'true'
+        shell: bash
+        run: |
+          echo "STACKQL_MCP_BUNDLE=${{ github.workspace }}/packaging/mcpb/dist/stackql-mcp-${{ matrix.target }}.mcpb" >> "$GITHUB_ENV"
+          echo "CHECKSUM_DIR=${{ github.workspace }}/packaging/mcpb/dist" >> "$GITHUB_ENV"
+      - name: GNU make (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: choco install make -y --no-progress
+      # toolchains
+      - if: matrix.vector == 'cargo'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: ${{ matrix.target == 'windows-arm64' && 'aarch64-pc-windows-msvc' || '' }}
+      - name: Build native ARM64 Rust launcher
+        if: matrix.vector == 'cargo' && matrix.target == 'windows-arm64'
+        shell: bash
+        run: echo "CARGO_BUILD_TARGET=aarch64-pc-windows-msvc" >> "$GITHUB_ENV"
+      - if: matrix.vector == 'cargo'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packaging/mcpb/cargo
+      - if: matrix.vector == 'go'
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: packaging/mcpb/go/go.sum
+      - if: matrix.vector == 'dotnet'
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      # render -> build/test/lint/package -> smoke
+      - name: Render platforms.json + version stamp
+        shell: bash
+        run: make ${{ matrix.vector }}-manifest VERSION="$VERSION"
+      - name: Build, lint, unit tests, package
+        shell: bash
+        run: make ${{ matrix.vector }}-build VERSION="$VERSION"
+      - name: Smoke test (launcher via scripts/smoke-test.py --cmd)
+        shell: bash
+        run: make ${{ matrix.vector }}-smoke VERSION="$VERSION" PYTHON=${{ matrix.py }}
+
+  # --- SDK publish (dispatch only, after every sdk slice is green) ----------
+  # Idempotent where the registry allows (skip if the version already exists);
+  # each prints the resulting coordinate. Ordering vs the registry entry is
+  # unchanged: mcp-registry-publish still runs last (it does not reference
+  # these packages; server.json package types are npm/pypi/oci/mcpb only).
+  cargo-publish:
+    name: publish cargo (crates.io)
+    if: needs.version.outputs.is_publish == 'true'
+    needs: [version, sdk]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: make cargo-publish VERSION=${{ needs.version.outputs.version }}
+
+  # NuGet Trusted Publishing (OIDC): the nuget.org policy "stackql-mcp-packaging"
+  # (owner stackql, repo stackql/stackql, workflow mcp-packaging.yml) exchanges
+  # this job's GitHub OIDC token for a short-lived push key. No stored secret.
+  dotnet-publish:
+    name: publish dotnet (NuGet)
+    if: needs.version.outputs.is_publish == 'true'
+    needs: [version, sdk]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      - name: NuGet login (trusted publishing)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: stackql
+      - env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+        run: make dotnet-publish VERSION=${{ needs.version.outputs.version }}
+
+  go-publish:
+    name: publish go (mirror stackql-mcp-go, tag)
+    if: needs.version.outputs.is_publish == 'true'
+    needs: [version, sdk]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - env:
+          SDK_MIRROR_TOKEN: ${{ secrets.SDK_MIRROR_TOKEN }}
+        run: make go-publish VERSION=${{ needs.version.outputs.version }}
+
+  # npm Trusted Publishing (OIDC): the npmjs.com trusted publisher on
+  # @stackql/mcp-server (owner stackql, repo stackql/stackql, workflow
+  # mcp-packaging.yml) exchanges this job's GitHub OIDC token for a
+  # short-lived publish token; npm attaches provenance. No stored secret.
+  # NODE_AUTH_TOKEN / NPM_TOKEN must NOT be set anywhere in this job.
+  npm-publish:
+    name: publish npm (@stackql/mcp-server)
+    if: needs.version.outputs.is_publish == 'true'
+    needs: [version, sdk]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          # October 2026 security release: TLS hostname CVEs, Brotli RCE, eMudhra CA removal
+          node-version: '24.22.1'
+          registry-url: 'https://registry.npmjs.org'
+      - run: make npm-publish VERSION=${{ needs.version.outputs.version }}

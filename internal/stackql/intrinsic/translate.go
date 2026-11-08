@@ -1,0 +1,1085 @@
+package intrinsic
+
+// A SELECT over the document-driven providers is handed to omnisdk whole. This
+// file turns the parsed statement into omnisdk's query.Unresolved: FROM becomes
+// joins over registry addresses, WHERE and each ON become conjuncts, and the
+// select list becomes named outputs. omnisdk decides which conditions become
+// request parameters, edges between tables, or row filters.
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/stackql-labs/omnisdk/pkg/omnisdk"
+	"github.com/stackql-labs/omnisdk/pkg/query"
+
+	"github.com/stackql/stackql-parser/go/vt/sqlparser"
+)
+
+// starOutput marks a select-list slot the first row's columns fill.
+const starOutput = "*"
+
+// docQuery is a SELECT translated for omnisdk: the query itself, the output
+// names in select-list order, and the LIMIT to push down.
+type docQuery interface {
+	getQuery() query.Unresolved
+	getOutputs() []string
+	getLimit() int
+	getBundles() []string
+}
+
+type standardDocQuery struct {
+	q       query.Unresolved
+	outputs []string
+	limit   int
+	bundles []string
+	hints   map[string]omnisdk.ReadHints
+}
+
+func newDocQuery(
+	q query.Unresolved,
+	outputs []string,
+	limit int,
+	bundles []string,
+	hints ...map[string]omnisdk.ReadHints,
+) docQuery {
+	var read map[string]omnisdk.ReadHints
+	if len(hints) > 0 {
+		read = hints[0]
+	}
+	return &standardDocQuery{q: q, outputs: outputs, limit: limit, bundles: bundles, hints: read}
+}
+func (d *standardDocQuery) getReadHints() map[string]omnisdk.ReadHints { return d.hints }
+
+func (d *standardDocQuery) getQuery() query.Unresolved { return d.q }
+
+func (d *standardDocQuery) getOutputs() []string { return d.outputs }
+
+func (d *standardDocQuery) getLimit() int { return d.limit }
+
+func (d *standardDocQuery) getBundles() []string { return d.bundles }
+
+// fromDocProviders reports whether a FROM clause reads the document-driven
+// providers, and refuses one mixing them with anything else: omnisdk runs the
+// whole query, so every relation in it has to be one it can resolve.
+//
+//nolint:gocognit // Classify each FROM relation, including nested SELECTs, in one traversal.
+func fromDocProviders(from sqlparser.TableExprs, currentProvider string) (bool, error) {
+	var docs, others []string
+	var walk func(expr sqlparser.TableExpr)
+	var walkStatement func(sqlparser.SelectStatement)
+	walk = func(expr sqlparser.TableExpr) {
+		switch node := expr.(type) {
+		case *sqlparser.AliasedTableExpr:
+			if sub, ok := node.Expr.(*sqlparser.Subquery); ok {
+				walkStatement(sub.Select)
+				return
+			}
+			tableName, isName := node.Expr.(sqlparser.TableName)
+			if isName && tableName.Name.GetRawVal() == "dual" &&
+				tableName.Qualifier.IsEmpty() && tableName.QualifierSecond.IsEmpty() {
+				return
+			}
+			if !isName {
+				others = append(others, sqlparser.String(node))
+				return
+			}
+			if _, isDoc := docProvider(
+				resolveProvider(tableName.QualifierSecond.GetRawVal(), currentProvider)); isDoc {
+				docs = append(docs, tableName.Name.GetRawVal())
+				return
+			}
+			others = append(others, qualifiedName(tableName))
+		case *sqlparser.TableValuedFuncTableExpr:
+			// Function signatures and lateral inputs are resolved by Omni.
+			return
+		case *sqlparser.JoinTableExpr:
+			walk(node.LeftExpr)
+			walk(node.RightExpr)
+		case *sqlparser.ParenTableExpr:
+			for _, inner := range node.Exprs {
+				walk(inner)
+			}
+		default:
+			others = append(others, sqlparser.String(node))
+		}
+	}
+	walkStatement = func(stmt sqlparser.SelectStatement) {
+		switch node := stmt.(type) {
+		case *sqlparser.Select:
+			for _, child := range node.From {
+				walk(child)
+			}
+		case *sqlparser.ParenSelect:
+			walkStatement(node.Select)
+		case *sqlparser.Union:
+			walkStatement(node.FirstStatement)
+			for _, branch := range node.UnionSelects {
+				walkStatement(branch.Statement)
+			}
+		}
+	}
+	for _, expr := range from {
+		walk(expr)
+	}
+	if len(docs) == 0 {
+		return false, nil
+	}
+	if len(others) > 0 {
+		return true, fmt.Errorf(
+			"%s relations cannot be combined with %s in one query",
+			UnstablePrefix+"*", strings.Join(others, ", "))
+	}
+	return true, nil
+}
+
+// selectQuery builds the omnisdk query for a SELECT over document-driven
+// relations. What omnisdk leaves to the caller - ordering, grouping,
+// aggregation, de-duplication - is refused until stackql applies it over the
+// streamed rows.
+func (d docTranslation) selectQuery(node *sqlparser.Select) (docQuery, error) {
+	if unsupported := unsupportedDocClauses(node); len(unsupported) > 0 {
+		return nil, fmt.Errorf("%s cannot be applied to %s relations; remove %s from the query",
+			strings.Join(unsupported, ", "), UnstablePrefix+"*", pluralClause(len(unsupported)))
+	}
+	limit, err := pushedLimit(node.Limit)
+	if err != nil {
+		return nil, err
+	}
+	t, where, err := d.translateSource(node)
+	if err != nil {
+		return nil, err
+	}
+	outputs, names, err := selectOutputs(node.SelectExprs)
+	if err != nil {
+		return nil, err
+	}
+	q, err := query.New(t.joins, where, outputs)
+	if err != nil {
+		return nil, err
+	}
+	return newDocQuery(q, names, limit, t.bundles, readHints(node)), nil
+}
+
+// translateSource translates a SELECT's FROM and WHERE: the joins omnisdk runs
+// and the conjuncts it applies to them.
+func (d docTranslation) translateSource(node *sqlparser.Select) (*translator, []query.Predicate, error) {
+	t := &translator{currentProvider: d.currentProvider, dialect: d.dialect}
+	// A comma-separated FROM is a cross join of its items; WHERE then says how they relate.
+	for i, item := range node.From {
+		form := query.Cross
+		if i == 0 {
+			form = query.Base
+		}
+		if err := t.from(item, form, nil); err != nil {
+			return nil, nil, err
+		}
+	}
+	deferred := t.deferForwardInnerConditions()
+	if node.Where == nil {
+		return t, deferred, nil
+	}
+	where, err := t.conjuncts(node.Where.Expr)
+	if err != nil {
+		return nil, nil, err
+	}
+	return t, append(deferred, where...), nil
+}
+
+// SQLite accepts INNER JOIN conditions referring to a later comma relation.
+// Move only those predicates to WHERE; outer-join conditions retain their boundary.
+func (t *translator) deferForwardInnerConditions() []query.Predicate {
+	scope := map[string]bool{}
+	var deferred []query.Predicate
+	for i, join := range t.joins {
+		scope[join.Resource().Alias()] = true
+		if join.Form() != query.Inner {
+			continue
+		}
+		var retained []query.Predicate
+		for _, predicate := range join.On() {
+			if joinPredicateInScope(predicate, scope) {
+				retained = append(retained, predicate)
+			} else {
+				deferred = append(deferred, predicate)
+			}
+		}
+		t.joins[i] = query.NewJoin(join.Resource(), join.Form(), retained...)
+	}
+	return deferred
+}
+
+func joinPredicateInScope(predicate query.Predicate, scope map[string]bool) bool {
+	switch p := predicate.(type) {
+	case query.Compare:
+		return joinExpressionInScope(p.Left(), scope) && joinExpressionInScope(p.Right(), scope)
+	case query.In:
+		return joinExpressionInScope(p.Expr(), scope) && joinExpressionInScope(p.Set(), scope)
+	case query.Test:
+		return joinExpressionInScope(p.Cond(), scope)
+	case query.Or:
+		for _, child := range p.Any() {
+			if !joinPredicateInScope(child, scope) {
+				return false
+			}
+		}
+	case query.Not:
+		return joinPredicateInScope(p.Negated(), scope)
+	}
+	return true
+}
+
+func joinExpressionInScope(expression query.Expr, scope map[string]bool) bool {
+	switch e := expression.(type) {
+	case query.Column:
+		return e.Qualifier() == "" || scope[e.Qualifier()]
+	case query.Call:
+		for _, child := range e.Args() {
+			if !joinExpressionInScope(child, scope) {
+				return false
+			}
+		}
+	case query.Collection:
+		for _, child := range e.Items() {
+			if !joinExpressionInScope(child, scope) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// unsupportedDocClauses names what omnisdk returns unapplied: its row stream is
+// unordered, ungrouped and not de-duplicated. LIMIT is pushed down instead.
+func unsupportedDocClauses(node *sqlparser.Select) []string {
+	var out []string
+	if len(node.OrderBy) > 0 {
+		out = append(out, "ORDER BY")
+	}
+	if len(node.GroupBy) > 0 {
+		out = append(out, "GROUP BY")
+	}
+	if node.Having != nil {
+		out = append(out, "HAVING")
+	}
+	if node.Distinct {
+		out = append(out, "DISTINCT")
+	}
+	return out
+}
+
+// pushedLimit is the row cap omnisdk applies. Without ORDER BY a LIMIT needs
+// no sorted input, so it can stop the stream early.
+func pushedLimit(limit *sqlparser.Limit) (int, error) {
+	if limit == nil {
+		return 0, nil
+	}
+	if limit.Offset != nil {
+		return 0, fmt.Errorf("OFFSET cannot be applied to %s relations", UnstablePrefix+"*")
+	}
+	val, isVal := limit.Rowcount.(*sqlparser.SQLVal)
+	if !isVal || val.Type != sqlparser.IntVal {
+		return 0, fmt.Errorf("LIMIT %s is not a row count", sqlparser.String(limit.Rowcount))
+	}
+	n, err := strconv.Atoi(string(val.Val))
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("LIMIT %s is not a positive row count", string(val.Val))
+	}
+	return n, nil
+}
+
+// docTranslator turns stackql SQL over document-driven relations into omnisdk queries, spelling
+// what the parse holds as operators in the backend's dialect.
+type docTranslator interface {
+	// selectQuery is a SELECT, whole.
+	selectQuery(node *sqlparser.Select) (docQuery, error)
+	// mutation is an INSERT, UPDATE or DELETE.
+	mutation(stmt sqlparser.Statement) (docQuery, error)
+	// source is a SELECT's FROM and WHERE alone, the rest left to the caller.
+	source(node *sqlparser.Select) (translatedSource, error)
+}
+
+// translatedSource is a SELECT's FROM and WHERE as omnisdk takes them.
+type translatedSource interface {
+	joins() []query.Join
+	where() []query.Predicate
+	bundles() []string
+}
+
+// newDocTranslator is the translator for queries whose current provider is currentProvider, on a
+// backend of dialect d.
+func newDocTranslator(currentProvider string, d sqlDialect) docTranslator {
+	return docTranslation{currentProvider: currentProvider, dialect: d}
+}
+
+type docTranslation struct {
+	currentProvider string
+	dialect         sqlDialect
+}
+
+func (d docTranslation) source(node *sqlparser.Select) (translatedSource, error) {
+	t, where, err := d.translateSource(node)
+	if err != nil {
+		return nil, err
+	}
+	return source{joinList: t.joins, conjuncts: where, bundleList: t.bundles}, nil
+}
+
+type source struct {
+	joinList   []query.Join
+	conjuncts  []query.Predicate
+	bundleList []string
+}
+
+func (s source) joins() []query.Join      { return s.joinList }
+func (s source) where() []query.Predicate { return s.conjuncts }
+func (s source) bundles() []string        { return s.bundleList }
+
+// translator is one statement's translation in progress.
+type translator struct {
+	dialect         sqlDialect
+	currentProvider string
+	joins           []query.Join
+	bundles         []string
+}
+
+// from appends a FROM item's joins in source order. A join's right side takes
+// the join's form and ON; everything on its left keeps its own.
+func (t *translator) from(expr sqlparser.TableExpr, form query.JoinForm, on []query.Predicate) error {
+	switch node := expr.(type) {
+	case *sqlparser.TableValuedFuncTableExpr:
+		return t.tableFunction(node, form, on)
+	case *sqlparser.AliasedTableExpr:
+		tableName, isName := node.Expr.(sqlparser.TableName)
+		if !isName {
+			return fmt.Errorf("'%s' cannot be read from %s relations", sqlparser.String(node), UnstablePrefix+"*")
+		}
+		if len(t.joins) == 0 {
+			form = query.Base
+		}
+		t.joins = append(t.joins, query.NewJoin(t.resource(tableName, node.As), form, on...))
+		return nil
+	case *sqlparser.ParenTableExpr:
+		if len(node.Exprs) != 1 {
+			return fmt.Errorf("'%s' cannot be read from %s relations", sqlparser.String(node), UnstablePrefix+"*")
+		}
+		return t.from(node.Exprs[0], form, on)
+	case *sqlparser.JoinTableExpr:
+		rightForm, err := joinForm(node.Join)
+		if err != nil {
+			return err
+		}
+		if err = t.from(node.LeftExpr, form, on); err != nil {
+			return err
+		}
+		var rightOn []query.Predicate
+		switch {
+		case node.Condition.On != nil:
+			if rightOn, err = t.conjuncts(node.Condition.On); err != nil {
+				return err
+			}
+		case len(node.Condition.Using) > 0:
+			// USING (c) is ON left.c = right.c, left being the table joined just before.
+			if rightOn, err = t.using(node.RightExpr, node.Condition.Using); err != nil {
+				return err
+			}
+		case rightForm == query.Inner:
+			// A JOIN with no condition, CROSS JOIN among them, pairs every row with every row.
+			rightForm = query.Cross
+		}
+		return t.from(node.RightExpr, rightForm, rightOn)
+	default:
+		return fmt.Errorf("'%s' cannot be read from %s relations", sqlparser.String(node), UnstablePrefix+"*")
+	}
+}
+
+func (t *translator) tableFunction(
+	node *sqlparser.TableValuedFuncTableExpr, form query.JoinForm, on []query.Predicate,
+) error {
+	call, err := expression(node.FuncExpr)
+	if err != nil {
+		return err
+	}
+	function, ok := call.(query.Call)
+	if !ok {
+		return fmt.Errorf("table function requires a function call")
+	}
+	alias := node.As.GetRawVal()
+	if alias == "" {
+		alias = function.Func()
+	}
+	t.joins = append(t.joins, query.NewJoin(query.NewTableFunction(alias, function), form, on...))
+	return nil
+}
+
+// resource addresses a relation by its registry handle, aliased as written or
+// else by its own name, and records the bundle whose credential it runs under.
+func (t *translator) resource(tableName sqlparser.TableName, as sqlparser.TableIdent) query.Resource {
+	bundle, _ := docProvider(resolveProvider(tableName.QualifierSecond.GetRawVal(), t.currentProvider))
+	t.bundles = append(t.bundles, bundle)
+	alias := as.GetRawVal()
+	if alias == "" {
+		alias = tableName.Name.GetRawVal()
+	}
+	address := fmt.Sprintf("%s%s.%s.%s", UnstablePrefix, bundle,
+		tableName.Qualifier.GetRawVal(), tableName.Name.GetRawVal())
+	return query.NewResource(alias, address)
+}
+
+// using is the ON a JOIN ... USING spells: each column equal on the table joined just before and on
+// the right side.
+func (t *translator) using(right sqlparser.TableExpr, cols sqlparser.Columns) ([]query.Predicate, error) {
+	aliased, isAliased := right.(*sqlparser.AliasedTableExpr)
+	if !isAliased || len(t.joins) == 0 {
+		return nil, fmt.Errorf("JOIN ... USING needs a table on each side")
+	}
+	rightName, isName := aliased.Expr.(sqlparser.TableName)
+	if !isName {
+		return nil, fmt.Errorf("JOIN ... USING needs a table on each side")
+	}
+	rightAlias := aliased.As.GetRawVal()
+	if rightAlias == "" {
+		rightAlias = rightName.Name.GetRawVal()
+	}
+	leftAlias := t.joins[len(t.joins)-1].Resource().Alias()
+	out := make([]query.Predicate, 0, len(cols))
+	for _, c := range cols {
+		out = append(out, query.NewEq(query.NewColumn(leftAlias, c.GetRawVal()), query.NewColumn(rightAlias, c.GetRawVal())))
+	}
+	return out, nil
+}
+
+func qualifiedName(tableName sqlparser.TableName) string {
+	var parts []string
+	for _, part := range []string{
+		tableName.QualifierSecond.GetRawVal(), tableName.Qualifier.GetRawVal(), tableName.Name.GetRawVal(),
+	} {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return strings.Join(parts, ".")
+}
+
+func joinForm(join string) (query.JoinForm, error) {
+	switch strings.ToLower(join) {
+	case sqlparser.JoinStr:
+		return query.Inner, nil
+	case sqlparser.LeftJoinStr, sqlparser.LeftOuterJoinStr:
+		return query.Left, nil
+	default:
+		return query.Base, fmt.Errorf("%s cannot be applied to %s relations",
+			strings.ToUpper(join), UnstablePrefix+"*")
+	}
+}
+
+// conjuncts splits a condition at its top-level ANDs.
+func (t *translator) conjuncts(expr sqlparser.Expr) ([]query.Predicate, error) {
+	if and, isAnd := expr.(*sqlparser.AndExpr); isAnd {
+		left, err := t.conjuncts(and.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := t.conjuncts(and.Right)
+		if err != nil {
+			return nil, err
+		}
+		return append(left, right...), nil
+	}
+	p, err := t.predicate(expr)
+	if err != nil {
+		return nil, err
+	}
+	return []query.Predicate{p}, nil
+}
+
+var compareOps = map[string]query.CompareOp{ //nolint:gochecknoglobals // fixed mapping
+	sqlparser.EqualStr:        query.Eq,
+	sqlparser.NotEqualStr:     query.Ne,
+	sqlparser.LessThanStr:     query.Lt,
+	sqlparser.LessEqualStr:    query.Le,
+	sqlparser.GreaterThanStr:  query.Gt,
+	sqlparser.GreaterEqualStr: query.Ge,
+}
+
+func (t *translator) predicate(expr sqlparser.Expr) (query.Predicate, error) {
+	switch node := expr.(type) {
+	case *sqlparser.AndExpr:
+		parts, err := t.conjuncts(node)
+		if err != nil {
+			return nil, err
+		}
+		// Under OR or NOT an AND is a single predicate: every part must hold.
+		negated := make([]query.Predicate, 0, len(parts))
+		for _, part := range parts {
+			negated = append(negated, query.NewNot(part))
+		}
+		return query.NewNot(query.NewOr(negated...)), nil
+	case *sqlparser.OrExpr:
+		left, err := t.predicate(node.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := t.predicate(node.Right)
+		if err != nil {
+			return nil, err
+		}
+		return query.NewOr(left, right), nil
+	case *sqlparser.NotExpr:
+		inner, err := t.predicate(node.Expr)
+		if err != nil {
+			return nil, err
+		}
+		return query.NewNot(inner), nil
+	case *sqlparser.ComparisonExpr:
+		return t.comparison(node)
+	case *sqlparser.IsExpr:
+		return isNull(node)
+	case *sqlparser.RangeCond:
+		return between(node)
+	case *sqlparser.FuncExpr:
+		call, err := expression(node)
+		if err != nil {
+			return nil, err
+		}
+		return query.NewTest(call), nil
+	default:
+		return nil, fmt.Errorf("condition '%s' cannot be applied to %s relations",
+			sqlparser.String(expr), UnstablePrefix+"*")
+	}
+}
+
+// isNull is never unknown: is_null is true or false, so NOT of it is exact.
+func isNull(node *sqlparser.IsExpr) (query.Predicate, error) {
+	e, err := expression(node.Expr)
+	if err != nil {
+		return nil, err
+	}
+	switch node.Operator {
+	case sqlparser.IsNullStr:
+		return query.NewTest(query.NewCall("is_null", e)), nil
+	case sqlparser.IsNotNullStr:
+		return query.NewNot(query.NewTest(query.NewCall("is_null", e))), nil
+	}
+	return nil, fmt.Errorf("condition '%s' cannot be applied to %s relations",
+		sqlparser.String(node), UnstablePrefix+"*")
+}
+
+func between(node *sqlparser.RangeCond) (query.Predicate, error) {
+	parts := []sqlparser.Expr{node.Left, node.From, node.To}
+	args := make([]query.Expr, 0, len(parts))
+	for _, part := range parts {
+		e, err := expression(part)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, e)
+	}
+	test := query.NewTest(query.NewCall("between", args...))
+	if node.Operator == sqlparser.NotBetweenStr {
+		return query.NewNot(test), nil
+	}
+	return test, nil
+}
+
+func (t *translator) comparison(node *sqlparser.ComparisonExpr) (query.Predicate, error) {
+	left, err := expression(node.Left)
+	if err != nil {
+		return nil, err
+	}
+	right, err := expression(node.Right)
+	if err != nil {
+		return nil, err
+	}
+	switch node.Operator {
+	case sqlparser.InStr:
+		return query.NewIn(left, right), nil
+	case sqlparser.NotInStr:
+		return query.NewNot(query.NewIn(left, right)), nil
+	case sqlparser.LikeStr, sqlparser.NotLikeStr:
+		var escape query.Expr
+		if node.Escape != nil {
+			var escErr error
+			if escape, escErr = expression(node.Escape); escErr != nil {
+				return nil, escErr
+			}
+		}
+		like := query.NewTest(t.dialect.like(left, right, escape))
+		if node.Operator == sqlparser.NotLikeStr {
+			return query.NewNot(like), nil
+		}
+		return like, nil
+	}
+	op, known := compareOps[node.Operator]
+	if !known {
+		return nil, fmt.Errorf("condition '%s' cannot be applied to %s relations",
+			sqlparser.String(node), UnstablePrefix+"*")
+	}
+	return query.NewCompare(op, left, right), nil
+}
+
+func expression(expr sqlparser.Expr) (query.Expr, error) {
+	switch node := expr.(type) {
+	case *sqlparser.ColName:
+		return query.NewColumn(node.Qualifier.Name.GetRawVal(), node.Name.GetRawVal()), nil
+	case *sqlparser.OrExpr:
+		// This parser formats the node as ||. In value position, retain that
+		// backend expression; predicate() handles logical OR separately.
+		return binaryExpression("||", node.Left, node.Right)
+	case *sqlparser.BinaryExpr:
+		if node.Operator != "||" && node.Operator != "+" && node.Operator != "-" &&
+			node.Operator != "*" && node.Operator != "/" && node.Operator != "%" {
+			return nil, fmt.Errorf("unsupported scalar operator %s", node.Operator)
+		}
+		return binaryExpression(node.Operator, node.Left, node.Right)
+	case *sqlparser.ComparisonExpr:
+		if _, known := compareOps[node.Operator]; !known {
+			return nil, fmt.Errorf("unsupported scalar comparison %s", node.Operator)
+		}
+		return binaryExpression(node.Operator, node.Left, node.Right)
+	case *sqlparser.SQLVal:
+		return literal(node)
+	case sqlparser.BoolVal:
+		return query.NewLiteral(bool(node)), nil
+	case *sqlparser.NullVal:
+		return query.NewLiteral(nil), nil
+	case sqlparser.ValTuple:
+		items := make([]query.Expr, 0, len(node))
+		for _, item := range node {
+			translated, err := expression(item)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, translated)
+		}
+		return query.NewCollection(items...), nil
+	case *sqlparser.CaseExpr:
+		return caseExpression(node)
+	case *sqlparser.ConvertExpr:
+		value, err := expression(node.Expr)
+		if err != nil {
+			return nil, err
+		}
+		return query.NewCall("cast", value, query.NewLiteral(sqlparser.String(node.Type))), nil
+	case *sqlparser.FuncExpr:
+		return functionExpression(node)
+	default:
+		return nil, fmt.Errorf("'%s' cannot be applied to %s relations",
+			sqlparser.String(expr), UnstablePrefix+"*")
+	}
+}
+
+func conditionExpression(node sqlparser.Expr) (query.Expr, error) {
+	switch condition := node.(type) {
+	case *sqlparser.AndExpr:
+		return logicalExpression("and", condition.Left, condition.Right)
+	case *sqlparser.OrExpr:
+		return logicalExpression("or", condition.Left, condition.Right)
+	case *sqlparser.NotExpr:
+		test, err := conditionExpression(condition.Expr)
+		return query.NewCall("not", test), err
+	case *sqlparser.IsExpr:
+		value, err := expression(condition.Expr)
+		if err != nil {
+			return nil, err
+		}
+		test := query.NewCall("is_null", value)
+		if condition.Operator == sqlparser.IsNullStr {
+			return test, nil
+		}
+		if condition.Operator == sqlparser.IsNotNullStr {
+			return query.NewCall("not", test), nil
+		}
+		return nil, fmt.Errorf("unsupported CASE test %s", condition.Operator)
+	default:
+		return expression(node)
+	}
+}
+
+func logicalExpression(operator string, left, right sqlparser.Expr) (query.Expr, error) {
+	lhs, err := conditionExpression(left)
+	if err != nil {
+		return nil, err
+	}
+	rhs, err := conditionExpression(right)
+	return query.NewCall(operator, lhs, rhs), err
+}
+
+func caseExpression(node *sqlparser.CaseExpr) (query.Expr, error) {
+	args := []query.Expr{}
+	name := "case_when"
+	if node.Expr != nil {
+		base, err := expression(node.Expr)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, base)
+		name = "case_value"
+	}
+	for _, branch := range node.Whens {
+		condition := branch.Cond
+		translate := conditionExpression
+		if node.Expr != nil {
+			translate = expression
+		}
+		test, err := translate(condition)
+		if err != nil {
+			return nil, err
+		}
+		value, err := expression(branch.Val)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, test, value)
+	}
+	var otherwise query.Expr = query.NewLiteral(nil)
+	if node.Else != nil {
+		var err error
+		otherwise, err = expression(node.Else)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return query.NewCall(name, append(args, otherwise)...), nil
+}
+
+func functionExpression(node *sqlparser.FuncExpr) (query.Expr, error) {
+	if node.IsAggregate() || node.Distinct || node.Over != nil {
+		return nil, fmt.Errorf("'%s' cannot be applied to %s relations",
+			sqlparser.String(node), UnstablePrefix+"*")
+	}
+	args := make([]query.Expr, 0, len(node.Exprs))
+	for _, arg := range node.Exprs {
+		aliased, isAliased := arg.(*sqlparser.AliasedExpr)
+		if !isAliased {
+			return nil, fmt.Errorf("argument '%s' cannot be applied to %s relations",
+				sqlparser.String(arg), UnstablePrefix+"*")
+		}
+		translated, err := expression(aliased.Expr)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, translated)
+	}
+	return query.NewCall(node.Name.Lowered(), args...), nil
+}
+
+func binaryExpression(operator string, left, right sqlparser.Expr) (query.Expr, error) {
+	lhs, err := expression(left)
+	if err != nil {
+		return nil, err
+	}
+	rhs, err := expression(right)
+	if err != nil {
+		return nil, err
+	}
+	return query.NewCall(operator, lhs, rhs), nil
+}
+
+func literal(val *sqlparser.SQLVal) (query.Expr, error) {
+	switch val.Type { //nolint:exhaustive // hex, bit and bind values have no omnisdk literal
+	case sqlparser.StrVal:
+		return query.NewLiteral(strings.ReplaceAll(string(val.Val), `\"`, `"`)), nil
+	case sqlparser.IntVal:
+		n, err := strconv.ParseInt(string(val.Val), 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		return query.NewLiteral(n), nil
+	case sqlparser.FloatVal:
+		f, err := strconv.ParseFloat(string(val.Val), 64)
+		if err != nil {
+			return nil, err
+		}
+		return query.NewLiteral(f), nil
+	default:
+		return nil, fmt.Errorf("'%s' cannot be applied to %s relations",
+			sqlparser.String(val), UnstablePrefix+"*")
+	}
+}
+
+// selectOutputs names every output: an alias, else a bare column's own name,
+// else the host's legacy expression label. A star is left unnamed for omnisdk to expand.
+func selectOutputs(exprs sqlparser.SelectExprs) ([]query.Output, []string, error) {
+	outputs := make([]query.Output, 0, len(exprs))
+	names := make([]string, 0, len(exprs))
+	anonymous := 0
+	for _, expr := range exprs {
+		switch node := expr.(type) {
+		case *sqlparser.StarExpr:
+			outputs = append(outputs, query.NewOutput("", query.NewStar(node.TableName.Name.GetRawVal())))
+			names = append(names, starOutput)
+		case *sqlparser.AliasedExpr:
+			translated, err := expression(node.Expr)
+			if err != nil {
+				return nil, nil, err
+			}
+			name, err := projectionName(node)
+			if err != nil {
+				return nil, nil, err
+			}
+			if name == "" {
+				anonymous++
+				name = fmt.Sprintf("col_%d", anonymous)
+			}
+			outputs = append(outputs, query.NewOutput(name, translated))
+			names = append(names, name)
+		default:
+			return nil, nil, fmt.Errorf("'%s' cannot be applied to %s relations",
+				sqlparser.String(expr), UnstablePrefix+"*")
+		}
+	}
+	return outputs, names, nil
+}
+
+// mutationTables is every relation a mutation reads or writes: the target
+// first, then its sources.
+func mutationTables(stmt sqlparser.Statement) (sqlparser.TableExprs, bool) {
+	switch node := stmt.(type) {
+	case *sqlparser.Insert:
+		tables := sqlparser.TableExprs{&sqlparser.AliasedTableExpr{Expr: node.Table}}
+		if sel, isSelect := node.Rows.(*sqlparser.Select); isSelect && !literalSource(sel.From) {
+			tables = append(tables, sel.From...)
+		}
+		return tables, true
+	case *sqlparser.Update:
+		return append(append(sqlparser.TableExprs{}, node.TableExprs...), updateSources(node)...), true
+	case *sqlparser.Delete:
+		return node.TableExprs, true
+	default:
+		return nil, false
+	}
+}
+
+// mutation builds the omnisdk mutation for an INSERT, UPDATE or
+// DELETE whose target is a document-driven relation. A RETURNING list becomes
+// the mutation's outputs.
+func (d docTranslation) mutation(stmt sqlparser.Statement) (docQuery, error) {
+	t := &translator{currentProvider: d.currentProvider, dialect: d.dialect}
+	var (
+		target    query.Target
+		where     []query.Predicate
+		returning sqlparser.SelectExprs
+		err       error
+	)
+	switch node := stmt.(type) {
+	case *sqlparser.Insert:
+		target, where, err = t.insert(node)
+		returning = node.SelectExprs
+	case *sqlparser.Update:
+		target, where, err = t.update(node)
+		returning = node.SelectExprs
+	case *sqlparser.Delete:
+		target, where, err = t.delete(node)
+		returning = node.SelectExprs
+	default:
+		return nil, fmt.Errorf("'%s' cannot be applied to %s relations", sqlparser.String(stmt), UnstablePrefix+"*")
+	}
+	if err != nil {
+		return nil, err
+	}
+	var outputs []query.Output
+	var names []string
+	if len(returning) > 0 {
+		if outputs, names, err = selectOutputs(returning); err != nil {
+			return nil, err
+		}
+	}
+	q, err := query.NewMutation(target, t.joins, where, outputs)
+	if err != nil {
+		return nil, err
+	}
+	return newDocQuery(q, names, 0, t.bundles), nil
+}
+
+// insert takes its values from a single VALUES row, or from a SELECT whose
+// relations become the mutation's sources and whose list is matched to the
+// columns by position.
+func (t *translator) insert(node *sqlparser.Insert) (query.Target, []query.Predicate, error) {
+	switch {
+	case !strings.EqualFold(node.Action, sqlparser.InsertStr):
+		return nil, nil, fmt.Errorf("%s cannot be applied to %s relations; use INSERT",
+			strings.ToUpper(node.Action), UnstablePrefix+"*")
+	case node.Ignore != "" || len(node.OnDup) > 0:
+		return nil, nil, fmt.Errorf("INSERT IGNORE and ON DUPLICATE KEY cannot be applied to %s relations",
+			UnstablePrefix+"*")
+	case len(node.Columns) == 0:
+		return nil, nil, fmt.Errorf("an INSERT into %s relations must name its columns", UnstablePrefix+"*")
+	}
+	resource := t.resource(node.Table, sqlparser.NewTableIdent(""))
+	var values []sqlparser.Expr
+	var where []query.Predicate
+	switch rows := node.Rows.(type) {
+	case sqlparser.Values:
+		if len(rows) != 1 {
+			return nil, nil, fmt.Errorf("an INSERT into %s relations takes exactly one VALUES row; got %d",
+				UnstablePrefix+"*", len(rows))
+		}
+		values = rows[0]
+	case *sqlparser.Select:
+		var err error
+		if values, where, err = t.insertSelect(rows); err != nil {
+			return nil, nil, err
+		}
+	default:
+		return nil, nil, fmt.Errorf("'%s' cannot be inserted into %s relations",
+			sqlparser.String(node.Rows), UnstablePrefix+"*")
+	}
+	if len(values) != len(node.Columns) {
+		return nil, nil, fmt.Errorf("INSERT names %d columns but supplies %d values", len(node.Columns), len(values))
+	}
+	assignments := make([]query.Assignment, 0, len(values))
+	for i, value := range values {
+		translated, err := expression(value)
+		if err != nil {
+			return nil, nil, err
+		}
+		assignments = append(assignments, query.NewAssignment(node.Columns[i].GetRawVal(), translated))
+	}
+	return query.NewInsert(resource, assignments...), where, nil
+}
+
+// insertSelect reads an INSERT ... SELECT: its relations become the mutation's
+// sources, and its list supplies the values, matched to the columns by position.
+func (t *translator) insertSelect(rows *sqlparser.Select) ([]sqlparser.Expr, []query.Predicate, error) {
+	if unsupported := unsupportedDocClauses(rows); len(unsupported) > 0 || rows.Limit != nil {
+		return nil, nil, fmt.Errorf("an INSERT ... SELECT into %s relations takes no "+
+			"ORDER BY, GROUP BY, HAVING, DISTINCT or LIMIT", UnstablePrefix+"*")
+	}
+	if len(rows.From) != 1 {
+		return nil, nil, fmt.Errorf("a comma-separated FROM cannot be applied to %s relations; use JOIN ... ON",
+			UnstablePrefix+"*")
+	}
+	if !literalSource(rows.From) {
+		if err := t.from(rows.From[0], query.Base, nil); err != nil {
+			return nil, nil, err
+		}
+	}
+	where, err := t.whereConjuncts(rows.Where)
+	if err != nil {
+		return nil, nil, err
+	}
+	values := make([]sqlparser.Expr, 0, len(rows.SelectExprs))
+	for _, expr := range rows.SelectExprs {
+		aliased, isAliased := expr.(*sqlparser.AliasedExpr)
+		if !isAliased {
+			return nil, nil, fmt.Errorf("'%s' cannot be inserted into %s relations; name each value",
+				sqlparser.String(expr), UnstablePrefix+"*")
+		}
+		values = append(values, aliased.Expr)
+	}
+	return values, where, nil
+}
+
+func (t *translator) update(node *sqlparser.Update) (query.Target, []query.Predicate, error) {
+	if !strings.EqualFold(node.Action, sqlparser.UpdateStr) && !strings.EqualFold(node.Action, "replace") {
+		return nil, nil, fmt.Errorf("%s cannot be applied to %s relations; use UPDATE",
+			strings.ToUpper(node.Action), UnstablePrefix+"*")
+	}
+	if len(node.OrderBy) > 0 || node.Limit != nil {
+		return nil, nil, fmt.Errorf("ORDER BY and LIMIT cannot be applied to an UPDATE of %s relations",
+			UnstablePrefix+"*")
+	}
+	resource, err := t.targetResource(node.TableExprs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = t.sources(updateSources(node)); err != nil {
+		return nil, nil, err
+	}
+	assignments := make([]query.Assignment, 0, len(node.Exprs))
+	for _, set := range node.Exprs {
+		translated, translateErr := expression(set.Expr)
+		if translateErr != nil {
+			return nil, nil, translateErr
+		}
+		assignments = append(assignments, query.NewAssignment(set.Name.Name.GetRawVal(), translated))
+	}
+	where, err := t.whereConjuncts(node.Where)
+	if err != nil {
+		return nil, nil, err
+	}
+	if strings.EqualFold(node.Action, "replace") {
+		return query.NewReplace(resource, assignments...), where, nil
+	}
+	return query.NewUpdate(resource, assignments...), where, nil
+}
+
+func (t *translator) delete(node *sqlparser.Delete) (query.Target, []query.Predicate, error) {
+	switch {
+	case len(node.Targets) > 0:
+		return nil, nil, fmt.Errorf("a multi-table DELETE cannot be applied to %s relations", UnstablePrefix+"*")
+	case len(node.OrderBy) > 0 || node.Limit != nil:
+		return nil, nil, fmt.Errorf("ORDER BY and LIMIT cannot be applied to a DELETE of %s relations",
+			UnstablePrefix+"*")
+	}
+	resource, err := t.targetResource(node.TableExprs)
+	if err != nil {
+		return nil, nil, err
+	}
+	where, err := t.whereConjuncts(node.Where)
+	if err != nil {
+		return nil, nil, err
+	}
+	return query.NewDelete(resource), where, nil
+}
+
+// targetResource is the single relation an UPDATE or DELETE writes.
+func (t *translator) targetResource(exprs sqlparser.TableExprs) (query.Resource, error) {
+	if len(exprs) == 1 {
+		if aliased, isAliased := exprs[0].(*sqlparser.AliasedTableExpr); isAliased {
+			if tableName, isName := aliased.Expr.(sqlparser.TableName); isName {
+				return t.resource(tableName, aliased.As), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("'%s' cannot be written as one %s relation", sqlparser.String(exprs), UnstablePrefix+"*")
+}
+
+// updateSources is an UPDATE's FROM clause. The parser stands in "dual" for an
+// absent one, which reads nothing.
+func updateSources(node *sqlparser.Update) sqlparser.TableExprs {
+	if len(node.From) == 1 {
+		if aliased, isAliased := node.From[0].(*sqlparser.AliasedTableExpr); isAliased {
+			if tableName, isName := aliased.Expr.(sqlparser.TableName); isName &&
+				tableName.Qualifier.IsEmpty() && tableName.Name.GetRawVal() == "dual" {
+				return nil
+			}
+		}
+	}
+	return node.From
+}
+
+// sources reads an UPDATE ... FROM clause as the mutation's source joins.
+func (t *translator) sources(from sqlparser.TableExprs) error {
+	switch len(from) {
+	case 0:
+		return nil
+	case 1:
+		return t.from(from[0], query.Base, nil)
+	default:
+		return fmt.Errorf("a comma-separated FROM cannot be applied to %s relations; use JOIN ... ON",
+			UnstablePrefix+"*")
+	}
+}
+
+func (t *translator) whereConjuncts(where *sqlparser.Where) ([]query.Predicate, error) {
+	if where == nil {
+		return nil, nil
+	}
+	return t.conjuncts(where.Expr)
+}
+
+// literalSource is the parser's source for SELECT values without a resource.
+func literalSource(from sqlparser.TableExprs) bool {
+	if len(from) != 1 {
+		return false
+	}
+	aliased, ok := from[0].(*sqlparser.AliasedTableExpr)
+	if !ok || !aliased.As.IsEmpty() {
+		return false
+	}
+	table, ok := aliased.Expr.(sqlparser.TableName)
+	return ok && table.Qualifier.IsEmpty() && strings.EqualFold(table.Name.String(), "dual")
+}

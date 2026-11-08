@@ -1,0 +1,345 @@
+package mcp_server //nolint:testpackage,revive // exercise internal wiring
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// TestEmbeddedContent_LoadsAndValidates is the build-time gate for all
+// embedded markdown: malformed frontmatter, duplicate names or unresolved
+// placeholders fail here rather than at server start.
+func TestEmbeddedContent_LoadsAndValidates(t *testing.T) {
+	instructions, err := loadEmbeddedInstructions()
+	if err != nil {
+		t.Fatalf("instructions: %v", err)
+	}
+	if instructions == "" {
+		t.Errorf("instructions should not be empty")
+	}
+	prompts, err := loadEmbeddedPrompts()
+	if err != nil {
+		t.Fatalf("prompts: %v", err)
+	}
+	if len(prompts) == 0 {
+		t.Errorf("expected at least one embedded prompt")
+	}
+	resources, err := loadEmbeddedResources()
+	if err != nil {
+		t.Fatalf("resources: %v", err)
+	}
+	if len(resources) == 0 {
+		t.Errorf("expected at least one embedded resource")
+	}
+	descriptions, err := loadEmbeddedToolDescriptions()
+	if err != nil {
+		t.Fatalf("tool descriptions: %v", err)
+	}
+	if len(descriptions.names()) == 0 {
+		t.Errorf("expected at least one embedded tool description")
+	}
+}
+
+// TestToolDescriptions_CoverPublishedTools pins the two directions of the
+// content/tools contract: every published tool carries its mastered
+// description, and every description file names a published tool.
+func TestToolDescriptions_CoverPublishedTools(t *testing.T) {
+	cs := connectInProcess(t, DefaultConfig(), &testBackend{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	list, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	descriptions, err := loadEmbeddedToolDescriptions()
+	if err != nil {
+		t.Fatalf("tool descriptions: %v", err)
+	}
+	published := map[string]bool{}
+	for _, tool := range list.Tools {
+		published[tool.Name] = true
+		want, ok := descriptions.describe(tool.Name)
+		if !ok || tool.Description != want {
+			t.Errorf("tool %q: published description %q does not match content/tools", tool.Name, tool.Description)
+		}
+	}
+	for _, name := range descriptions.names() {
+		if !published[name] {
+			t.Errorf("content/tools/%s.md describes a tool that is not published", name)
+		}
+	}
+}
+
+// TestToolDescriptions_MarkdownProseIsPublished reads one description file
+// from disk, independently of the loader, and checks that tools/list exposes
+// its prose: frontmatter stripped, wrapped lines joined by single spaces.
+func TestToolDescriptions_MarkdownProseIsPublished(t *testing.T) {
+	const toolName = "run_select_query"
+	raw, err := os.ReadFile(filepath.Join("content", "tools", toolName+".md"))
+	if err != nil {
+		t.Fatalf("read markdown: %v", err)
+	}
+	parts := strings.SplitN(string(raw), "---", 3)
+	if len(parts) != 3 || !strings.Contains(parts[1], "name: "+toolName) {
+		t.Fatalf("unexpected file shape: %q", raw)
+	}
+	if !strings.Contains(strings.TrimSpace(parts[2]), "\n") {
+		t.Fatalf("fixture must be wrapped over several lines to exercise prose collapsing")
+	}
+	want := strings.Join(strings.Fields(parts[2]), " ")
+
+	cs := connectInProcess(t, DefaultConfig(), &testBackend{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	list, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range list.Tools {
+		if tool.Name != toolName {
+			continue
+		}
+		if tool.Description != want {
+			t.Errorf("published description mismatch.\nwant: %q\ngot:  %q", want, tool.Description)
+		}
+		return
+	}
+	t.Fatalf("%s not published", toolName)
+}
+
+func TestLoadToolDescriptionsFrom_ValidatesAndCollapsesProse(t *testing.T) {
+	fsys := fstest.MapFS{
+		"tools/alpha.md": {Data: []byte("---\nname: alpha\ntitle: Alpha\nopen_world: false\n---\nFirst line\nsecond line.\n\nSecond paragraph.\n")},
+	}
+	descriptions, err := loadToolDescriptionsFrom(fsys, "tools")
+	if err != nil {
+		t.Fatalf("loadToolDescriptionsFrom: %v", err)
+	}
+	got, ok := descriptions.describe("alpha")
+	if !ok || got != "First line second line.\n\nSecond paragraph." {
+		t.Errorf("unexpected description %q (ok=%v)", got, ok)
+	}
+	if descriptions.title("alpha") != "Alpha" {
+		t.Errorf("unexpected title %q", descriptions.title("alpha"))
+	}
+	missing := fstest.MapFS{
+		"tools/alpha.md": {Data: []byte("---\nname: alpha\ntitle: Alpha\n---\nbody\n")},
+	}
+	if _, err := loadToolDescriptionsFrom(missing, "tools"); err == nil || !strings.Contains(err.Error(), "open_world") {
+		t.Errorf("expected missing open_world error, got %v", err)
+	}
+	mismatch := fstest.MapFS{
+		"tools/alpha.md": {Data: []byte("---\nname: beta\ntitle: Beta\nopen_world: false\n---\nbody\n")},
+	}
+	if _, err := loadToolDescriptionsFrom(mismatch, "tools"); err == nil || !strings.Contains(err.Error(), "file stem") {
+		t.Errorf("expected file stem mismatch error, got %v", err)
+	}
+	empty := fstest.MapFS{
+		"tools/alpha.md": {Data: []byte("---\nname: alpha\ntitle: Alpha\nopen_world: false\n---\n   \n")},
+	}
+	if _, err := loadToolDescriptionsFrom(empty, "tools"); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Errorf("expected empty body error, got %v", err)
+	}
+}
+
+// TestEmbeddedPrompt_CloudAudit_Loaded pins the flagship prompt: it must load
+// with a non-empty body and declare its documented optional arguments.
+func TestEmbeddedPrompt_CloudAudit_Loaded(t *testing.T) {
+	prompts, err := loadEmbeddedPrompts()
+	if err != nil {
+		t.Fatalf("prompts: %v", err)
+	}
+	for _, p := range prompts {
+		if p.Name() == "cloud_audit" {
+			if p.Body() == "" {
+				t.Errorf("cloud_audit body should not be empty")
+			}
+			argNames := map[string]bool{}
+			for _, a := range p.Arguments() {
+				argNames[a.Name] = true
+			}
+			if !argNames["clouds"] || !argNames["focus"] {
+				t.Errorf("cloud_audit should declare clouds and focus arguments, got %v", argNames)
+			}
+			return
+		}
+	}
+	t.Fatalf("cloud_audit not found among embedded prompts")
+}
+
+func TestSplitFrontmatter_Errors(t *testing.T) {
+	if _, _, err := splitFrontmatter([]byte("no frontmatter here")); err == nil {
+		t.Errorf("expected error for missing open delimiter")
+	}
+	if _, _, err := splitFrontmatter([]byte("---\nname: x\nno close")); err == nil {
+		t.Errorf("expected error for missing close delimiter")
+	}
+	meta, body, err := splitFrontmatter([]byte("---\r\nname: x\r\n---\r\nbody line\r\n"))
+	if err != nil {
+		t.Fatalf("splitFrontmatter: %v", err)
+	}
+	if meta != "name: x" || body != "body line" {
+		t.Errorf("unexpected split: meta=%q body=%q", meta, body)
+	}
+}
+
+func TestEmbeddedPrompt_PlaceholderValidationAndRender(t *testing.T) {
+	arg := &mcp.PromptArgument{Name: "region", Description: "cloud region", Required: true}
+	p, err := newEmbeddedPrompt("p1", "desc", []*mcp.PromptArgument{arg}, "list resources in {{region}}")
+	if err != nil {
+		t.Fatalf("newEmbeddedPrompt: %v", err)
+	}
+	out, err := p.Render(map[string]string{"region": "us-east1"})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if out != "list resources in us-east1" {
+		t.Errorf("unexpected render: %q", out)
+	}
+	if _, err := p.Render(nil); err == nil {
+		t.Errorf("expected error for missing required argument")
+	}
+	if _, err := newEmbeddedPrompt("p2", "desc", nil, "uses {{undeclared}}"); err == nil {
+		t.Errorf("expected error for unresolved placeholder")
+	}
+	if _, err := newEmbeddedPrompt("", "desc", nil, "body"); err == nil {
+		t.Errorf("expected error for missing name")
+	}
+}
+
+func TestLoadPromptsFrom_DetectsDuplicatesAndBadYAML(t *testing.T) {
+	dup := fstest.MapFS{
+		"prompts/a.md": {Data: []byte("---\nname: same\ndescription: d\n---\nbody a\n")},
+		"prompts/b.md": {Data: []byte("---\nname: same\ndescription: d\n---\nbody b\n")},
+	}
+	if _, err := loadPromptsFrom(dup, "prompts"); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("expected duplicate name error, got %v", err)
+	}
+	bad := fstest.MapFS{
+		"prompts/a.md": {Data: []byte("---\nname: x\nbogus_key: y\ndescription: d\n---\nbody\n")},
+	}
+	if _, err := loadPromptsFrom(bad, "prompts"); err == nil {
+		t.Errorf("expected strict yaml error for unknown key")
+	}
+}
+
+func TestLoadResourcesFrom_Defaults(t *testing.T) {
+	fsys := fstest.MapFS{
+		"resources/notes.md": {Data: []byte("---\nname: notes\ndescription: d\n---\nbody\n")},
+	}
+	resources, err := loadResourcesFrom(fsys, "resources")
+	if err != nil {
+		t.Fatalf("loadResourcesFrom: %v", err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected 1 resource, got %d", len(resources))
+	}
+	r := resources[0]
+	if r.URI() != "stackql://docs/notes" {
+		t.Errorf("default uri wrong: %q", r.URI())
+	}
+	if r.MIMEType() != "text/markdown" {
+		t.Errorf("default mime wrong: %q", r.MIMEType())
+	}
+}
+
+func TestInstructions_SurfacedInInitialize(t *testing.T) {
+	cs := connectInProcess(t, DefaultConfig(), &testBackend{})
+	want, err := loadEmbeddedInstructions()
+	if err != nil {
+		t.Fatalf("loadEmbeddedInstructions: %v", err)
+	}
+	got := cs.InitializeResult().Instructions
+	if got == "" || got != want {
+		t.Errorf("initialize instructions mismatch.\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+func TestInstructions_DisableInstructionsSuppresses(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DisableInstructions = true
+	cs := connectInProcess(t, cfg, &testBackend{})
+	if got := cs.InitializeResult().Instructions; got != "" {
+		t.Errorf("instructions should be suppressed, got %q", got)
+	}
+}
+
+func TestResources_ListAndRead(t *testing.T) {
+	cs := connectInProcess(t, DefaultConfig(), &testBackend{})
+	if cs.InitializeResult().Capabilities.Resources == nil {
+		t.Fatalf("resources capability should be declared")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	list, err := cs.ListResources(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+	var uri string
+	for _, r := range list.Resources {
+		if r.Name == "stackql_scope_discovery" {
+			uri = r.URI
+		}
+	}
+	if uri == "" {
+		t.Fatalf("stackql_scope_discovery not listed: %+v", list.Resources)
+	}
+	res, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: uri})
+	if err != nil {
+		t.Fatalf("ReadResource: %v", err)
+	}
+	if len(res.Contents) != 1 {
+		t.Fatalf("expected 1 content item, got %d", len(res.Contents))
+	}
+	c := res.Contents[0]
+	if c.URI != uri || c.MIMEType != "text/markdown" || !strings.Contains(c.Text, "enumeration") {
+		t.Errorf("unexpected contents: uri=%q mime=%q text=%q", c.URI, c.MIMEType, c.Text)
+	}
+}
+
+func TestResources_SyntheticInstructionsResource(t *testing.T) {
+	cs := connectInProcess(t, DefaultConfig(), &testBackend{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	list, err := cs.ListResources(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+	var uri string
+	for _, r := range list.Resources {
+		if r.Name == "stackql_server_instructions" {
+			uri = r.URI
+		}
+	}
+	if uri != "stackql://docs/instructions" {
+		t.Fatalf("stackql_server_instructions not listed with expected uri: %+v", list.Resources)
+	}
+	res, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: uri})
+	if err != nil {
+		t.Fatalf("ReadResource: %v", err)
+	}
+	want, err := loadEmbeddedInstructions()
+	if err != nil {
+		t.Fatalf("loadEmbeddedInstructions: %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].Text != want {
+		t.Errorf("instructions resource must be byte-identical to the initialize instructions")
+	}
+}
+
+func TestResources_EnabledResourcesFilters(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.EnabledResources = []string{"some_other_resource"}
+	cs := connectInProcess(t, cfg, &testBackend{})
+	// With every embedded resource filtered out, the capability is absent.
+	if cs.InitializeResult().Capabilities.Resources != nil {
+		t.Errorf("resources capability should not be declared when all resources are filtered")
+	}
+}

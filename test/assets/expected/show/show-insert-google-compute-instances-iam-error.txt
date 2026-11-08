@@ -1,0 +1,1 @@
+stackqldoc: resource "instances_iam_policies" declares no insert verb

@@ -1,0 +1,232 @@
+openapi: 3.0.1
+servers:
+  - url: http://localhost:1070
+info:
+  version: v0.1.0
+  title: OData predicate push-down
+  description: |-
+    Exercises the any-sdk ApplyPushdown helper wired into the stackql REST acquire
+    path. The flask mock echoes the (decoded) request query string into an `echoed`
+    column so tests can assert which OData options ($filter/$select/$orderby/$top/
+    $skip) were pushed. Single-word field names keep snake aliases == wire names.
+components:
+  schemas:
+    person:
+      type: object
+      properties:
+        name:
+          type: string
+        city:
+          type: string
+        age:
+          type: integer
+        created_at:
+          type: string
+        echoed:
+          type: string
+    people_response:
+      type: object
+      properties:
+        value:
+          type: array
+          items:
+            $ref: '#/components/schemas/person'
+  x-stackQL-resources:
+    people:
+      id: stackql_native_test.odata.people
+      name: people
+      title: People (OData push-down target)
+      config:
+        queryParamPushdown:
+          select:
+            dialect: odata
+          filter:
+            dialect: odata
+          orderBy:
+            dialect: odata
+          top:
+            dialect: odata
+          skip:
+            dialect: odata
+          count:
+            dialect: odata
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1odata~1people/get'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: value
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/people/methods/select'
+        delete: []
+        insert: []
+        update: []
+    people_restricted:
+      id: stackql_native_test.odata.people_restricted
+      name: people_restricted
+      title: People with per-capability supportedColumns allowlists ($select superset guard)
+      config:
+        queryParamPushdown:
+          select:
+            dialect: odata
+            supportedColumns:
+              - name
+              - echoed
+              - city
+          filter:
+            dialect: odata
+            supportedColumns:
+              - city
+              - age
+          orderBy:
+            dialect: odata
+            supportedColumns:
+              - city
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1odata~1people/get'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: value
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/people_restricted/methods/select'
+        delete: []
+        insert: []
+        update: []
+    people_sort_prefix:
+      id: stackql_native_test.odata.people_sort_prefix
+      name: people_sort_prefix
+      title: People (orderBy syntax prefix, sort=-col)
+      config:
+        queryParamPushdown:
+          orderBy:
+            paramName: sort
+            syntax: prefix
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1odata~1people/get'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: value
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/people_sort_prefix/methods/select'
+        delete: []
+        insert: []
+        update: []
+    people_sort_suffix:
+      id: stackql_native_test.odata.people_sort_suffix
+      name: people_sort_suffix
+      title: People (orderBy syntax suffix, sort=col:desc)
+      config:
+        queryParamPushdown:
+          orderBy:
+            paramName: sort
+            syntax: suffix
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1odata~1people/get'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: value
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/people_sort_suffix/methods/select'
+        delete: []
+        insert: []
+        update: []
+    people_sort_column_only:
+      id: stackql_native_test.odata.people_sort_column_only
+      name: people_sort_column_only
+      title: People (orderBy syntax column_only, sort=col)
+      config:
+        queryParamPushdown:
+          orderBy:
+            paramName: sort
+            syntax: column_only
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1odata~1people/get'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: value
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/people_sort_column_only/methods/select'
+        delete: []
+        insert: []
+        update: []
+    people_sort_direction_only:
+      id: stackql_native_test.odata.people_sort_direction_only
+      name: people_sort_direction_only
+      title: People (orderBy syntax direction_only, order=desc)
+      config:
+        queryParamPushdown:
+          orderBy:
+            paramName: order
+            syntax: direction_only
+            supportedColumns:
+              - created_at
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1odata~1people/get'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: value
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/people_sort_direction_only/methods/select'
+        delete: []
+        insert: []
+        update: []
+    people_sort_odata:
+      id: stackql_native_test.odata.people_sort_odata
+      name: people_sort_odata
+      title: People (orderBy syntax odata, explicit)
+      config:
+        queryParamPushdown:
+          orderBy:
+            dialect: odata
+            syntax: odata
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1odata~1people/get'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: value
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/people_sort_odata/methods/select'
+        delete: []
+        insert: []
+        update: []
+paths:
+  /odata/people:
+    get:
+      operationId: odata/people/get
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/people_response'
+      servers:
+        - url: http://localhost:1070
+      summary: List people (OData push-down target)

@@ -1,0 +1,563 @@
+package mcp_server //nolint:revive,stylecheck,mnd // fine for now
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v2"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/stackql/stackql/pkg/mcp_server/audit"
+	"github.com/stackql/stackql/pkg/mcp_server/policy"
+	"github.com/stackql/stackql/pkg/mcp_server/render"
+	"github.com/stackql/stackql/pkg/sink"
+)
+
+const (
+	// protocolVersionAuto leaves every SDK-supported revision advertised.
+	protocolVersionAuto = "auto"
+	// protocolVersionSessionless is the first revision without the initialize
+	// handshake; the SDK serves it over HTTP only from a stateless handler.
+	protocolVersionSessionless = "2026-07-28"
+)
+
+// Config represents the complete configuration for the MCP server.
+type Config struct {
+	// TLSConfig is supplied by the host for verified client certificate authentication.
+	TLSConfig *tls.Config `json:"-" yaml:"-"`
+	// AuthenticateRequest is a host-supplied transport boundary, never deserialized.
+	AuthenticateRequest func(*http.Request) (context.Context, error) `json:"-" yaml:"-"`
+	// Server contains server-specific configuration.
+	Server ServerConfig `json:"server" yaml:"server"`
+
+	// Backend contains backend-specific configuration.
+	Backend BackendConfig `json:"backend" yaml:"backend"`
+
+	// EnabledTools restricts which MCP tools the server publishes.
+	// When nil or empty, every built-in tool is published (default behavior).
+	// When populated, only the named tools are registered.
+	EnabledTools []string `json:"enabled_tools,omitempty" yaml:"enabled_tools,omitempty"`
+
+	// EnabledPrompts restricts which MCP prompts the server publishes.
+	// Same semantics as EnabledTools: nil or empty means all registered prompts are published.
+	EnabledPrompts []string `json:"enabled_prompts,omitempty" yaml:"enabled_prompts,omitempty"`
+
+	// EnabledResources restricts which MCP resources the server publishes.
+	// Same semantics as EnabledTools: nil or empty means all embedded resources are published.
+	EnabledResources []string `json:"enabled_resources,omitempty" yaml:"enabled_resources,omitempty"`
+
+	// DisableInstructions suppresses the embedded server instructions
+	// otherwise surfaced in the initialize result.
+	DisableInstructions bool `json:"disable_instructions,omitempty" yaml:"disable_instructions,omitempty"`
+
+	// QueryLibrary configures the query library tools (query_library_search,
+	// query_library_get).  Zero value means defaults + env var resolution.
+	QueryLibrary QueryLibraryConfig `json:"query_library,omitempty" yaml:"query_library,omitempty"`
+}
+
+// QueryLibraryConfig configures retrieval of the published query library.
+// Explicit config wins over env vars, which win over defaults.  Env vars:
+// STACKQL_QUERY_LIBRARY_BASE_URL, STACKQL_QUERY_LIBRARY_OFFLINE,
+// STACKQL_QUERY_LIBRARY_TTL (seconds).
+type QueryLibraryConfig struct {
+	BaseURL     string `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	FallbackURL string `json:"fallback_url,omitempty" yaml:"fallback_url,omitempty"`
+	Offline     bool   `json:"offline,omitempty" yaml:"offline,omitempty"`
+	TTLSeconds  int    `json:"ttl_seconds,omitempty" yaml:"ttl_seconds,omitempty"`
+}
+
+// nameEnabled reports whether name is allowed by an allowlist where nil or
+// empty means everything is enabled.
+func nameEnabled(allow []string, name string) bool {
+	if len(allow) == 0 {
+		return true
+	}
+	for _, n := range allow {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// IsToolEnabled reports whether the named tool should be published.
+// Empty/nil EnabledTools means all tools are enabled.
+func (c *Config) IsToolEnabled(name string) bool {
+	return nameEnabled(c.EnabledTools, name)
+}
+
+// IsPromptEnabled reports whether the named prompt should be published.
+// Empty/nil EnabledPrompts means all prompts are enabled.
+func (c *Config) IsPromptEnabled(name string) bool {
+	return nameEnabled(c.EnabledPrompts, name)
+}
+
+// IsResourceEnabled reports whether the named resource should be published.
+// Empty/nil EnabledResources means all resources are enabled.
+func (c *Config) IsResourceEnabled(name string) bool {
+	return nameEnabled(c.EnabledResources, name)
+}
+
+func (c *Config) GetServerTransport() string {
+	if c.Server.Transport == "" {
+		return DefaultConfig().Server.Transport
+	}
+	return c.Server.Transport
+}
+
+func (c *Config) GetServerAddress() string {
+	if c.Server.Address == "" {
+		return DefaultConfig().Server.Address
+	}
+	return c.Server.Address
+}
+
+func (c *Config) IsTcpBackend() bool {
+	return c.Backend.Type == "tcp"
+}
+
+func (c *Config) GetBackendConnectionString() string {
+	if c.Backend.ConnectionString == "" {
+		return DefaultConfig().Backend.ConnectionString
+	}
+	return c.Backend.ConnectionString
+}
+
+// GetMode returns the server's effective mode.  Empty string is mapped to
+// the safe default.
+func (c *Config) GetMode() string {
+	if c == nil || c.Server.Mode == "" {
+		return policy.ModeSafe
+	}
+	return c.Server.Mode
+}
+
+// GetRender returns the server-level default render format for tool result
+// text content.  Empty string is mapped to the markdown default.
+func (c *Config) GetRender() string {
+	if c == nil || c.Server.Render == "" {
+		return render.FormatMarkdown
+	}
+	return c.Server.Render
+}
+
+// IsAuditEnabled reports whether audit logging should run.  Audit is on by
+// default unless explicitly disabled.
+func (c *Config) IsAuditEnabled() bool {
+	if c == nil || c.Server.Audit.Disabled {
+		return false
+	}
+	return true
+}
+
+// GetProtocolVersion returns the configured revision ceiling, with "auto"
+// substituted for empty input.
+func (c *Config) GetProtocolVersion() string {
+	if c == nil || c.Server.ProtocolVersion == "" {
+		return protocolVersionAuto
+	}
+	return c.Server.ProtocolVersion
+}
+
+// AdvertisedProtocolVersions maps the ceiling onto
+// mcp.ServerOptions.SupportedProtocolVersions; nil keeps the SDK default.
+// The sessionless revision stands alone because its lifecycle differs;
+// any older ceiling keeps that revision and everything before it.
+func (c *Config) AdvertisedProtocolVersions() []string {
+	pinned := c.GetProtocolVersion()
+	if pinned == protocolVersionAuto {
+		return nil
+	}
+	if pinned == protocolVersionSessionless {
+		return []string{pinned}
+	}
+	var out []string
+	for _, v := range mcp.SupportedProtocolVersions() { // newest first
+		if v <= pinned {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// IsStateless reports whether Streamable HTTP runs without sessions: set
+// explicitly, or implied by pinning the sessionless revision.
+func (c *Config) IsStateless() bool {
+	return c != nil && (c.Server.Stateless || c.GetProtocolVersion() == protocolVersionSessionless)
+}
+
+// ServerConfig contains configuration for the MCP server itself.
+type ServerConfig struct {
+	// Name is the server name advertised to clients.
+	Name string `json:"name" yaml:"name"`
+
+	// Transport specifies the transport configuration for the server.
+	Transport string `json:"transport" yaml:"transport"`
+
+	// Address is the server Address advertised to clients.
+	Address string `json:"address" yaml:"address"`
+
+	// Scheme is the protocol scheme used by the server.
+	Scheme string `json:"scheme" yaml:"scheme"`
+
+	// Version is the server version advertised to clients.
+	Version string `json:"version" yaml:"version"`
+
+	TLSCertFile string `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile  string `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty"`
+
+	// AuthTokenEnvVar names an env var holding a bearer token.  When set, the
+	// HTTP transport requires `Authorization: Bearer <token>` on every request.
+	AuthTokenEnvVar string `json:"auth_token_env_var,omitempty" yaml:"auth_token_env_var,omitempty"`
+
+	// ApprovalKeyEnvVar names an env var holding the HMAC-SHA256 key that
+	// signs the approval RequestState (issue #827).  Unset, each process
+	// uses a random key, which suits stdio and a single HTTP instance.  Set
+	// it to the same value on every instance of a sessionless Streamable
+	// HTTP deployment behind a load balancer.  The value must hold at least
+	// 32 bytes and is never logged or audited.
+	ApprovalKeyEnvVar string `json:"approval_key_env_var,omitempty" yaml:"approval_key_env_var,omitempty"`
+
+	// AllowUnauthenticated is the explicit opt-in to serve the HTTP transport
+	// with no client authentication.  Without it or AuthTokenEnvVar the HTTP
+	// transport refuses to start.
+	AllowUnauthenticated bool `json:"allow_unauthenticated,omitempty" yaml:"allow_unauthenticated,omitempty"`
+
+	TransportCfg map[string]any `json:"transport_cfg,omitempty" yaml:"transport_cfg,omitempty"`
+
+	// Stateless serves Streamable HTTP without sessions (no Mcp-Session-Id),
+	// which is how the SDK serves protocol revision 2026-07-28 over HTTP.
+	// Off by default: a stateful server keeps legacy clients' sessions (and
+	// their elicitation capability) and negotiates 2026-07-28 clients down
+	// via server/discover. Ignored for stdio, which serves every revision.
+	Stateless bool `json:"stateless,omitempty" yaml:"stateless,omitempty"`
+
+	// ProtocolVersion pins the newest revision advertised (issue #784).
+	// "auto" or empty keeps the SDK default; "2026-07-28" serves only the
+	// sessionless revision and implies Stateless for HTTP; an older revision
+	// keeps it and everything before it, so a 2026-07-28 request is answered
+	// with the SDK's -32022 downgrade error.  Legal values: "auto" plus
+	// mcp.SupportedProtocolVersions().
+	ProtocolVersion string `json:"protocol_version,omitempty" yaml:"protocol_version,omitempty"`
+
+	// Description is a human-readable description of the server.
+	Description string `json:"description" yaml:"description"`
+
+	// MaxConcurrentRequests limits the number of concurrent client requests.
+	MaxConcurrentRequests int `json:"max_concurrent_requests" yaml:"max_concurrent_requests"`
+
+	// RequestTimeout specifies the timeout for individual requests.
+	RequestTimeout Duration `json:"request_timeout" yaml:"request_timeout"`
+
+	// Mode controls the safety contract for query / mutation / lifecycle tools.
+	// Legal values: "read_only", "safe", "delete_safe", "full_access".
+	// Empty string is treated as "safe".
+	//
+	// For back-compat with PR1, the JSON/YAML key `read_only: true` is also
+	// accepted and is equivalent to Mode = "read_only".  When both `mode`
+	// and `read_only` are set, `mode` wins.
+	Mode string `json:"mode,omitempty" yaml:"mode,omitempty"`
+
+	// Render sets the server-level default for tool result text content.
+	// Legal values: "markdown" (default), "json".  A per-call `format`
+	// argument on a tool overrides this default (issue #669).
+	Render string `json:"render,omitempty" yaml:"render,omitempty"`
+
+	// Audit configures the audit subsystem.  Audit is enabled by default
+	// (Disabled is false) and writes to a file sink.
+	Audit AuditConfig `json:"audit,omitempty" yaml:"audit,omitempty"`
+}
+
+// serverConfigWire mirrors ServerConfig with the legacy `read_only` flag
+// included as a transient field.  Used only for unmarshalling.
+type serverConfigWire struct {
+	Name                  string         `json:"name" yaml:"name"`
+	Transport             string         `json:"transport" yaml:"transport"`
+	Address               string         `json:"address" yaml:"address"`
+	Scheme                string         `json:"scheme" yaml:"scheme"`
+	Version               string         `json:"version" yaml:"version"`
+	TLSCertFile           string         `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile            string         `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty"`
+	AuthTokenEnvVar       string         `json:"auth_token_env_var,omitempty" yaml:"auth_token_env_var,omitempty"`
+	ApprovalKeyEnvVar     string         `json:"approval_key_env_var,omitempty" yaml:"approval_key_env_var,omitempty"`
+	AllowUnauthenticated  bool           `json:"allow_unauthenticated,omitempty" yaml:"allow_unauthenticated,omitempty"`
+	TransportCfg          map[string]any `json:"transport_cfg,omitempty" yaml:"transport_cfg,omitempty"`
+	Stateless             bool           `json:"stateless,omitempty" yaml:"stateless,omitempty"`
+	ProtocolVersion       string         `json:"protocol_version,omitempty" yaml:"protocol_version,omitempty"`
+	Description           string         `json:"description" yaml:"description"`
+	MaxConcurrentRequests int            `json:"max_concurrent_requests" yaml:"max_concurrent_requests"`
+	RequestTimeout        Duration       `json:"request_timeout" yaml:"request_timeout"`
+	Mode                  string         `json:"mode,omitempty" yaml:"mode,omitempty"`
+	Render                string         `json:"render,omitempty" yaml:"render,omitempty"`
+	Audit                 AuditConfig    `json:"audit,omitempty" yaml:"audit,omitempty"`
+	// LegacyReadOnly preserves the PR1 `read_only: true` wire form.
+	LegacyReadOnly *bool `json:"read_only,omitempty" yaml:"read_only,omitempty"`
+}
+
+func (s *ServerConfig) fromWire(w serverConfigWire) {
+	s.Name = w.Name
+	s.Transport = w.Transport
+	s.Address = w.Address
+	s.Scheme = w.Scheme
+	s.Version = w.Version
+	s.TLSCertFile = w.TLSCertFile
+	s.TLSKeyFile = w.TLSKeyFile
+	s.AuthTokenEnvVar = w.AuthTokenEnvVar
+	s.ApprovalKeyEnvVar = w.ApprovalKeyEnvVar
+	s.AllowUnauthenticated = w.AllowUnauthenticated
+	s.TransportCfg = w.TransportCfg
+	s.Stateless = w.Stateless
+	s.ProtocolVersion = w.ProtocolVersion
+	s.Description = w.Description
+	s.MaxConcurrentRequests = w.MaxConcurrentRequests
+	s.RequestTimeout = w.RequestTimeout
+	s.Mode = w.Mode
+	s.Render = w.Render
+	s.Audit = w.Audit
+	// Legacy: `read_only: true` with no `mode` -> Mode = "read_only".
+	// `mode` always wins.
+	if s.Mode == "" && w.LegacyReadOnly != nil && *w.LegacyReadOnly {
+		s.Mode = policy.ModeReadOnly
+	}
+}
+
+// UnmarshalJSON honours the legacy `read_only: true` shim.
+func (s *ServerConfig) UnmarshalJSON(data []byte) error {
+	var w serverConfigWire
+	if err := decodeConfigJSON(data, &w); err != nil {
+		return err
+	}
+	s.fromWire(w)
+	return nil
+}
+
+// UnmarshalYAML honours the legacy `read_only: true` shim.
+func (s *ServerConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var w serverConfigWire
+	if err := unmarshal(&w); err != nil {
+		return err
+	}
+	s.fromWire(w)
+	return nil
+}
+
+// AuditConfig configures the audit subsystem.
+type AuditConfig struct {
+	// Disabled turns the audit subsystem off entirely.  Default false
+	// (audit is on by default).
+	Disabled bool `json:"disabled,omitempty" yaml:"disabled,omitempty"`
+
+	// FailureMode controls what happens when the sink returns an error.
+	// Legal values: "strict" (default), "strict_mutations", "best_effort".
+	FailureMode string `json:"failure_mode,omitempty" yaml:"failure_mode,omitempty"`
+
+	// Sink selects the destination kind.  Currently only "file" is
+	// implemented; other values are reserved.  Empty defaults to "file".
+	Sink string `json:"sink,omitempty" yaml:"sink,omitempty"`
+
+	// Format selects the record encoding: "jsonl" (default, one Event per
+	// line) or "otel" (OTLP/JSON log records, issue #729).
+	Format string `json:"format,omitempty" yaml:"format,omitempty"`
+
+	// File holds file-sink-specific options.  Only consulted when Sink is
+	// "file" (the default).
+	File sink.FileConfig `json:"file,omitempty" yaml:"file,omitempty"`
+}
+
+// GetFormat returns the effective log format with the default substituted
+// for empty input.
+func (a AuditConfig) GetFormat() string {
+	if a.Format == "" {
+		return audit.FormatJSONL
+	}
+	return a.Format
+}
+
+// GetFailureMode returns the effective failure-mode string with the default
+// substituted for empty input.
+func (a AuditConfig) GetFailureMode() string {
+	if a.FailureMode == "" {
+		return audit.FailureModeStrict
+	}
+	return a.FailureMode
+}
+
+// BackendConfig contains configuration for the backend connection.
+type BackendConfig struct {
+	// Type specifies the backend type ("tcp", "memory").
+	Type string `json:"type" yaml:"type"`
+
+	// AppName is an optional application name describing the backend.
+	// In the first instance, this is stackql.
+	// **Possible** future use case for the backing db (e.g., "postgres", "mysql", etc).
+	AppName string `json:"app_name" yaml:"app_name"`
+
+	// ConnectionString contains the connection details for the backend.
+	// Format depends on the backend type.
+	ConnectionString string `json:"dsn" yaml:"dsn"`
+
+	// MaxConnections limits the number of backend connections.
+	MaxConnections int `json:"max_connections" yaml:"max_connections"`
+
+	// ConnectionTimeout specifies the timeout for backend connections.
+	ConnectionTimeout Duration `json:"connection_timeout" yaml:"connection_timeout"`
+
+	// QueryTimeout specifies the timeout for individual queries.
+	QueryTimeout Duration `json:"query_timeout" yaml:"query_timeout"`
+}
+
+// Duration is a wrapper around time.Duration that can be marshaled to/from JSON and YAML.
+type Duration time.Duration
+
+// MarshalJSON implements json.Marshaler.
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	duration, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = Duration(duration)
+	return nil
+}
+
+// MarshalYAML implements yaml.Marshaler.
+func (d Duration) MarshalYAML() (interface{}, error) {
+	return time.Duration(d).String(), nil
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	duration, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = Duration(duration)
+	return nil
+}
+
+// DefaultConfig returns a configuration with sensible defaults.
+func defaultConfig() *Config {
+	return &Config{
+		Server: ServerConfig{
+			Name:                  "StackQL MCP Server",
+			Version:               "0.1.0",
+			Description:           "Model Context Protocol server for StackQL",
+			MaxConcurrentRequests: 100,
+			Transport:             serverTransportStdIO,
+			Address:               DefaultHTTPServerAddress,
+			RequestTimeout:        Duration(30 * time.Second),
+			Mode:                  policy.ModeSafe,
+		},
+		Backend: BackendConfig{
+			Type:              "stackql",
+			ConnectionString:  "stackql://localhost",
+			MaxConnections:    10,
+			ConnectionTimeout: Duration(10 * time.Second),
+			QueryTimeout:      Duration(30 * time.Second),
+		},
+	}
+}
+
+// DefaultConfig returns a configuration with sensible defaults.
+func DefaultConfig() *Config {
+	rv := defaultConfig()
+	return rv
+}
+
+func DefaultHTTPConfig() *Config {
+	rv := defaultConfig()
+	rv.Server.Transport = serverTransportHTTP
+	return rv
+}
+
+func DefaultSSEConfig() *Config {
+	rv := defaultConfig()
+	rv.Server.Transport = serverTransportSSE
+	return rv
+}
+
+// Validate validates the configuration and returns an error if invalid.
+func (c *Config) Validate() error {
+	switch c.Server.Transport {
+	case "", serverTransportStdIO, serverTransportHTTP, serverTransportSSE:
+	default:
+		return fmt.Errorf("invalid server.transport %q (legal: stdio, http, sse)", c.Server.Transport)
+	}
+	if !policy.IsLegalMode(c.Server.Mode) {
+		return fmt.Errorf("invalid server.mode %q (legal: read_only, safe, delete_safe, full_access)", c.Server.Mode)
+	}
+	if !render.IsLegalFormat(c.Server.Render) {
+		return fmt.Errorf("invalid server.render %q (legal: markdown, json)", c.Server.Render)
+	}
+	if v := c.GetProtocolVersion(); v != protocolVersionAuto && !slices.Contains(mcp.SupportedProtocolVersions(), v) {
+		return fmt.Errorf("invalid server.protocol_version %q (legal: auto, %s)",
+			c.Server.ProtocolVersion, strings.Join(mcp.SupportedProtocolVersions(), ", "))
+	}
+	switch c.Server.Audit.GetFormat() {
+	case audit.FormatJSONL, audit.FormatOTel:
+	default:
+		return fmt.Errorf("invalid server.audit.format %q (legal: jsonl, otel)", c.Server.Audit.Format)
+	}
+	switch c.Server.Audit.GetFailureMode() {
+	case audit.FailureModeStrict, audit.FailureModeStrictMutations, audit.FailureModeBestEffort:
+	default:
+		return fmt.Errorf("invalid server.audit.failure_mode %q (legal: strict, strict_mutations, best_effort)",
+			c.Server.Audit.FailureMode)
+	}
+	return nil
+}
+
+func decodeConfigJSON(data []byte, dst any) error {
+	data = bytes.TrimSpace(data)
+	if !json.Valid(data) || len(data) == 0 || data[0] != '{' {
+		return errors.New("expected a JSON object")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(dst)
+}
+
+// LoadFromJSON loads configuration from a JSON object, rejecting unknown fields.
+func LoadFromJSON(data []byte) (*Config, error) {
+	config := &Config{}
+	if err := decodeConfigJSON(data, config); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON config: %w", err)
+	}
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	return config, nil
+}
+
+// LoadFromYAML loads configuration from YAML data.
+func LoadFromYAML(data []byte) (*Config, error) {
+	config := &Config{}
+	if err := yaml.Unmarshal(data, config); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML config: %w", err)
+	}
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	return config, nil
+}

@@ -1,0 +1,459 @@
+# Makefile - thin wrapper around scripts/package.sh
+#
+# Usage:
+#   make VERSION=X.Y.Z              download release artefacts + build all bundles
+#   make download VERSION=X.Y.Z     just fetch the release artefacts into bin/
+#   make package VERSION=X.Y.Z      just build bundles from whatever is in bin/
+#   make <target> VERSION=X.Y.Z     build a single target
+#                                   (linux-x64|linux-arm64|windows-x64|windows-arm64|darwin-universal)
+#   make one TARGET=<t> VERSION=X.Y.Z  download + build a single target and
+#                                      fail hard if its bundle is not produced.
+#                                      Use this on a Mac to build only the
+#                                      darwin-universal bundle.
+#   make signed VERSION=X.Y.Z       build with MCPB_SELF_SIGN=true
+#   make publish VERSION=X.Y.Z      upload dist/*.mcpb (+ .sha256) to the
+#                                   stackql/stackql release matching v<VERSION>;
+#                                   assets already on the release are skipped
+#                                   (immutable once pinned; FORCE=1 overwrites).
+#                                   Requires 'gh auth login' with contents:write
+#                                   on stackql/stackql.
+#   make server-json VERSION=X.Y.Z  render registry/server.json from the template,
+#                                   pinning the five per-platform SHA-256s.
+#                                   Requires all five dist/*.sha256 files (run
+#                                   on a machine that has gathered all bundles).
+#   make registry-publish VERSION=X.Y.Z
+#                                   publish registry/server.json to the Official
+#                                   MCP Registry using mcp-publisher. Requires
+#                                   mcp-publisher installed and 'mcp-publisher
+#                                   login github'.
+#   make openai-plugin-manifest VERSION=X.Y.Z
+#                                   stamp + vendor the ChatGPT/Codex plugin payload
+#                                   (runs as part of npm-manifest)
+#   make claude-plugin-manifest VERSION=X.Y.Z
+#                                   stamp + vendor the Claude plugin payload (runs as
+#                                   part of npm-manifest)
+#   make openai-plugin-zip VERSION=X.Y.Z
+#                                   build the ChatGPT plugin directory ZIP under
+#                                   ../openai-plugin/dist/ (layout and size checked)
+#   make claude-plugin-mirror VERSION=X.Y.Z
+#                                   push ../claude-plugin to the stackql-claude-plugin
+#                                   mirror repo, the one the Anthropic directory tracks
+#   make check-published [VERSION=X.Y.Z]
+#                                   read-only assurance: probe every distribution
+#                                   target (release assets, releases.stackql.io,
+#                                   Docker Hub, npm, PyPI, crates.io, Go, NuGet,
+#                                   Official MCP Registry, GitHub MCP Registry)
+#                                   and PASS/FAIL each for VERSION (default: the
+#                                   latest stackql release). Publishes nothing.
+#   make list                       show artefacts present in bin/
+#   make clean                      wipe dist/
+#   make clean-bin                  wipe downloaded artefacts from bin/
+
+SHELL := bash
+.SHELLFLAGS := -eu -o pipefail -c
+
+# No release.yaml version pin: CI resolves the version from the release;
+# local invocations pass VERSION=X.Y.Z (check-version fails fast otherwise).
+VERSION ?=
+BIN_DIR ?= bin
+DIST_DIR ?= dist
+# Invoked via 'bash' so a lost executable bit (easy when committing from
+# Windows) cannot break the build.
+PACKAGE := bash scripts/package.sh
+
+RELEASE_BASE := https://github.com/stackql/stackql/releases/download
+ASSETS := stackql_linux_amd64.zip \
+          stackql_linux_arm64.zip \
+          stackql_windows_amd64.zip \
+          stackql_windows_arm64.zip \
+          stackql_darwin_multiarch.pkg
+
+OCI_IMAGE ?= stackql/stackql-mcp
+OCI_STAGE := .oci-stage
+
+.PHONY: all check-version check-target download package combined one signed sign publish \
+        server-json registry-publish check-published clean clean-bin \
+        linux-x64 linux-arm64 windows-x64 windows-arm64 darwin-universal \
+        oci-stage oci oci-push npm-manifest npm-pack npm-publish pypi-manifest pypi-build \
+        openai-plugin-manifest claude-plugin-manifest openai-plugin-zip claude-plugin-mirror \
+        list help
+
+all: download package
+
+help:
+	@echo "targets:"
+	@echo "  make VERSION=X.Y.Z              download release artefacts + build all bundles"
+	@echo "  make download VERSION=X.Y.Z     fetch release artefacts into $(BIN_DIR)/"
+	@echo "  make package VERSION=X.Y.Z      build bundles from whatever is in $(BIN_DIR)/"
+	@echo "  make <target> VERSION=X.Y.Z     build a single target"
+	@echo "                                  (linux-x64|linux-arm64|windows-x64|windows-arm64|darwin-universal)"
+	@echo "  make one TARGET=<t> VERSION=X.Y.Z  download + build a single target,"
+	@echo "                                  fail hard if the bundle is not produced"
+	@echo "                                  (use on a Mac for darwin-universal)"
+	@echo "  make signed VERSION=X.Y.Z       build with MCPB_SELF_SIGN=true"
+	@echo "  make sign                       envelope-sign dist/*.mcpb in place and"
+	@echo "                                  regenerate .sha256 (MCPB_SELF_SIGN=true"
+	@echo "                                  or MCPB_SIGN_CERT + MCPB_SIGN_KEY)"
+	@echo "  make publish VERSION=X.Y.Z      upload dist/* to the stackql/stackql"
+	@echo "                                  release matching v<VERSION>"
+	@echo "  make server-json VERSION=X.Y.Z  render registry/server.json (pins"
+	@echo "                                  SHAs from dist/*.sha256)"
+	@echo "  make registry-publish VERSION=X.Y.Z"
+	@echo "                                  publish to the Official MCP Registry"
+	@echo "                                  via mcp-publisher (renders first)"
+	@echo "  make check-published [VERSION=X.Y.Z]"
+	@echo "                                  read-only: PASS/FAIL every distribution"
+	@echo "                                  target for VERSION (default: latest release)"
+	@echo "  make openai-plugin-manifest VERSION=X.Y.Z   stamp + vendor the ChatGPT/Codex plugin"
+	@echo "  make claude-plugin-manifest VERSION=X.Y.Z   stamp + vendor the Claude plugin"
+	@echo "  make openai-plugin-zip VERSION=X.Y.Z        build the ChatGPT directory ZIP"
+	@echo "  make claude-plugin-mirror VERSION=X.Y.Z     push the Claude plugin to its mirror repo"
+	@echo "  make list                       show artefacts present in $(BIN_DIR)/"
+	@echo "  make clean                      wipe $(DIST_DIR)/"
+	@echo "  make clean-bin                  wipe downloaded artefacts from $(BIN_DIR)/"
+
+check-version:
+	@if [ -z "$(VERSION)" ]; then \
+	  echo "error: VERSION is required (e.g. make VERSION=0.10.500)," >&2; \
+	  echo "       or set stackql_release in release.yaml" >&2; exit 2; \
+	fi
+
+download: check-version
+	@command -v curl >/dev/null 2>&1 || { echo "error: curl is required for 'make download'" >&2; exit 2; }
+	@mkdir -p $(BIN_DIR)
+	@echo "downloading stackql v$(VERSION) release artefacts -> $(BIN_DIR)/"
+	@for asset in $(ASSETS); do \
+	  url="$(RELEASE_BASE)/v$(VERSION)/$$asset"; \
+	  dest="$(BIN_DIR)/$$asset"; \
+	  echo "  $$asset"; \
+	  curl -fsSL --retry 3 -o "$$dest" "$$url" || { \
+	    echo "  error: failed to download $$url" >&2; \
+	    rm -f "$$dest"; \
+	    exit 1; \
+	  }; \
+	done
+	@echo "done."
+
+check-target:
+	@case "$(TARGET)" in \
+	  linux-x64|linux-arm64|windows-x64|windows-arm64|darwin-universal) ;; \
+	  "" ) echo "error: TARGET is required (linux-x64|linux-arm64|windows-x64|windows-arm64|darwin-universal)" >&2; exit 2 ;; \
+	  *  ) echo "error: unknown TARGET '$(TARGET)' (linux-x64|linux-arm64|windows-x64|windows-arm64|darwin-universal)" >&2; exit 2 ;; \
+	esac
+
+# Download just one platform's artefact and build only that bundle. Designed
+# for the two-machine release flow: run 'make all' on your laptop for the
+# Linux/Windows bundles, then 'make one TARGET=darwin-universal' on a Mac
+# (e.g. MacInCloud) for the notarised .pkg slice.
+one: check-version check-target
+	@command -v curl >/dev/null 2>&1 || { echo "error: curl required" >&2; exit 2; }
+	@mkdir -p $(BIN_DIR)
+	@case "$(TARGET)" in \
+	  linux-x64)        asset=stackql_linux_amd64.zip ;; \
+	  linux-arm64)      asset=stackql_linux_arm64.zip ;; \
+	  windows-x64)      asset=stackql_windows_amd64.zip ;; \
+	  windows-arm64)    asset=stackql_windows_arm64.zip ;; \
+	  darwin-universal) asset=stackql_darwin_multiarch.pkg ;; \
+	esac; \
+	url="$(RELEASE_BASE)/v$(VERSION)/$$asset"; \
+	dest="$(BIN_DIR)/$$asset"; \
+	echo "downloading $$asset for target $(TARGET)"; \
+	curl -fsSL --retry 3 -o "$$dest" "$$url" || { echo "  error: download failed: $$url" >&2; rm -f "$$dest"; exit 1; }
+	$(PACKAGE) --version $(VERSION)
+	@out="$(DIST_DIR)/stackql-mcp-$(TARGET).mcpb"; \
+	if [ ! -f "$$out" ]; then \
+	  echo "error: expected bundle not produced: $$out" >&2; exit 1; \
+	fi; \
+	echo "produced $$out"
+
+package: check-version
+	$(PACKAGE) --version $(VERSION)
+
+# Multiplatform bundle for single-artefact venues: sources binaries from the
+# per-platform bundles in dist/ (never rebuilds) and byte-verifies the result.
+combined: check-version
+	$(PACKAGE) --version $(VERSION) --combined
+	python3 scripts/verify-combined.py $(DIST_DIR)/stackql-mcp-multiplatform.mcpb
+
+signed: check-version
+	MCPB_SELF_SIGN=true $(PACKAGE) --version $(VERSION)
+
+# Envelope-sign whatever is already in dist/ and regenerate the .sha256
+# files (the signature is appended to the bundle, so checksums must be
+# recomputed). Same env contract as package.sh: MCPB_SELF_SIGN=true, or
+# MCPB_SIGN_CERT + MCPB_SIGN_KEY (+ optional MCPB_SIGN_INTERMEDIATES).
+# No-ops with a notice when no signing material is configured, so CI can
+# call it unconditionally before 'make publish'.
+sign:
+	bash scripts/sign.sh
+
+# Render registry/server.json from the template, pinning the five per-platform
+# SHA-256s read from dist/*.sha256. Fails hard if any sha file is missing -
+# run this on a machine that has gathered all five bundles (typically the
+# workstation, after the Mac slice has been published and downloaded back, or
+# after copying the darwin sha file across).
+server-json: check-version
+	bash scripts/render-server-json.sh --version $(VERSION)
+
+# Publish the rendered server.json to the Official MCP Registry.
+# Requires:
+#   - mcp-publisher CLI on PATH (https://github.com/modelcontextprotocol/registry/releases)
+#   - 'mcp-publisher login github' completed once (browser flow)
+#   - GitHub user authorised on the 'stackql' org (for io.github.stackql/* namespace)
+registry-publish: check-version server-json
+	@command -v mcp-publisher >/dev/null 2>&1 || { \
+	  echo "error: mcp-publisher not on PATH" >&2; \
+	  echo "  install from https://github.com/modelcontextprotocol/registry/releases/latest" >&2; \
+	  exit 2; \
+	}
+	cd registry && mcp-publisher publish
+
+# Read-only assurance that a release's MCP server is live on every target:
+# GitHub release assets, releases.stackql.io, Docker Hub, npm, PyPI, crates.io,
+# Go mirror + proxy, NuGet, the Official MCP Registry (incl. sha256 pins vs the
+# release) and the GitHub MCP Registry. VERSION defaults to the latest stackql
+# release. Publishes nothing, mutates nothing; exits non-zero on any FAIL.
+# GH_TOKEN (if set) authenticates the api.github.com calls. --json via ARGS.
+check-published:
+	$(PYTHON) scripts/check-published.py $(if $(VERSION),--version $(VERSION)) $(ARGS)
+
+# --- OCI image ---------------------------------------------------------------
+# Extract the linux binaries from the release zips into the docker build
+# context. Downloads the zips first if they are not already in bin/.
+oci-stage: check-version
+	@command -v unzip >/dev/null 2>&1 || { echo "error: unzip required" >&2; exit 2; }
+	@mkdir -p $(BIN_DIR)
+	@for asset in stackql_linux_amd64.zip stackql_linux_arm64.zip; do \
+	  if [ ! -f "$(BIN_DIR)/$$asset" ]; then \
+	    echo "downloading $$asset"; \
+	    curl -fsSL --retry 3 -o "$(BIN_DIR)/$$asset" "$(RELEASE_BASE)/v$(VERSION)/$$asset" || { \
+	      rm -f "$(BIN_DIR)/$$asset"; exit 1; }; \
+	  fi; \
+	done
+	@rm -rf $(OCI_STAGE)
+	@mkdir -p $(OCI_STAGE)/linux/amd64 $(OCI_STAGE)/linux/arm64
+	@unzip -o -q $(BIN_DIR)/stackql_linux_amd64.zip stackql -d $(OCI_STAGE)/linux/amd64
+	@unzip -o -q $(BIN_DIR)/stackql_linux_arm64.zip stackql -d $(OCI_STAGE)/linux/arm64
+	@echo "staged linux binaries under $(OCI_STAGE)/"
+
+# Local single-arch (amd64) build for testing. Smoke test with:
+#   python scripts/smoke-test.py --docker $(OCI_IMAGE):$(VERSION)
+oci: oci-stage
+	docker buildx build --platform linux/amd64 --load \
+	  --build-arg VERSION=$(VERSION) \
+	  -f oci/Dockerfile -t $(OCI_IMAGE):$(VERSION) .
+
+# Multi-arch build + push. Requires 'docker login' with push rights on
+# docker.io/$(OCI_IMAGE).
+oci-push: oci-stage
+	docker buildx build --platform linux/amd64,linux/arm64 --push \
+	  --build-arg VERSION=$(VERSION) \
+	  -f oci/Dockerfile \
+	  -t docker.io/$(OCI_IMAGE):$(VERSION) \
+	  -t docker.io/$(OCI_IMAGE):latest .
+
+# --- npm wrapper ---------------------------------------------------------------
+# Render npm/platforms.json (bundle URLs + sha256 pins) and stamp the package
+# version. Run AFTER the .mcpb assets are published - it fetches the canonical
+# .sha256 files from the GitHub release, same rule as 'make server-json'.
+npm-manifest: check-version openai-plugin-manifest claude-plugin-manifest
+	bash scripts/render-npm-manifest.sh --version $(VERSION)
+
+# Build the publishable tarball. This is the LOCAL FALLBACK: CI publishes via
+# 'npm-publish' (trusted publishing). To publish by hand (npm 2FA):
+#   cd npm && npm publish --access public
+npm-pack: npm-manifest
+	cd npm && npm pack
+	@echo "tarball ready under npm/ - publish manually with: cd npm && npm publish --access public"
+
+# Publish from CI via npm trusted publishing (GitHub Actions OIDC; no token).
+# Provenance is attached automatically. Idempotent: skips if the version exists.
+npm-publish: npm-manifest
+	@if curl -fsSL "https://registry.npmjs.org/@stackql/mcp-server/$(VERSION)" >/dev/null 2>&1; then \
+	  echo "npm already has @stackql/mcp-server@$(VERSION) - skipping"; \
+	else \
+	  cd npm && npm publish --dry-run --access public && npm publish --access public \
+	    && echo "published https://www.npmjs.com/package/@stackql/mcp-server/v/$(VERSION)"; \
+	fi
+
+# --- Local stdio plugins (ChatGPT/Codex, Claude) ------------------------------
+# Both plugins vendor the npm launcher verbatim plus server/platforms.json,
+# LICENSE, the icon and the onboarding skill (scripts/render-platforms.sh),
+# and are stamped with the npm wrapper's version; the plugin validators fail
+# when any of it drifts. Both run as part of npm-manifest; commit the rendered
+# plugin directories together with the package.json bump (the directories
+# read the plugins from git, so platforms.json is committed here, unlike the
+# wrappers' gitignored copies).
+openai-plugin-manifest: check-version
+	bash scripts/render-platforms.sh --version $(VERSION) --vector openai-plugin
+
+claude-plugin-manifest: check-version
+	bash scripts/render-platforms.sh --version $(VERSION) --vector claude-plugin
+
+# ChatGPT plugin directory submission artefact: ../openai-plugin/dist/stackql-plugin-X.Y.Z.zip
+# (plugin contents at the ZIP root; hooks, app references and credentials refused).
+openai-plugin-zip: check-version
+	$(PYTHON) ../openai-plugin/scripts/validate.py
+	$(PYTHON) ../openai-plugin/scripts/build-zip.py --version $(VERSION)
+
+# The Anthropic directory reads a plugin from a GitHub repository and holds
+# every version of a subfolder plugin for a reviewer, so the rendered Claude
+# plugin is mirrored to stackql/stackql-claude-plugin (plugin at the repo root,
+# tag v<version>). Idempotent and immutable like go-publish; auth via
+# SDK_MIRROR_TOKEN or the local git credentials.
+claude-plugin-mirror: check-version
+	$(PYTHON) scripts/validate-claude-plugin.py
+	bash scripts/publish-mirror.sh --vector claude-plugin --version $(VERSION)
+
+# --- PyPI wrapper --------------------------------------------------------------
+# Same ordering rule as npm-manifest: run AFTER the .mcpb assets are published.
+pypi-manifest: check-version
+	bash scripts/render-pypi-manifest.sh --version $(VERSION)
+
+# Build sdist + wheel (needs 'pip install build'). Publishing stays manual
+# (PyPI 2FA / token):
+#   python -m twine upload pypi/dist/*
+pypi-build: pypi-manifest
+	cd pypi && python -m build
+	@echo "dist ready under pypi/dist/ - publish manually with: python -m twine upload pypi/dist/*"
+
+# Upload whatever landed in dist/ to the matching tag on stackql/stackql.
+# Release assets are IMMUTABLE once published: every wrapper (npm, PyPI, the
+# SDKs, the registry entry) pins their sha256, and releases.stackql.io caches
+# them under an immutable key. Rebuilt bundles are never byte-identical, so an
+# asset that already exists on the release is SKIPPED, not overwritten - which
+# also makes the two-machine flow (darwin from a Mac, the rest from a
+# workstation) and CI re-dispatches safe. FORCE=1 overwrites anyway (only for
+# a release nothing has pinned yet); otherwise cut a new patch release.
+publish: check-version
+	@command -v gh >/dev/null 2>&1 || { echo "error: gh CLI required (https://cli.github.com)" >&2; exit 2; }
+	@shopt -s nullglob; \
+	  files=( $(DIST_DIR)/stackql-mcp-*.mcpb $(DIST_DIR)/stackql-mcp-*.mcpb.sha256 ); \
+	  if [ $${#files[@]} -eq 0 ]; then \
+	    echo "error: nothing in $(DIST_DIR)/ to publish" >&2; exit 1; \
+	  fi; \
+	  existing="$$(gh release view "v$(VERSION)" --repo stackql/stackql --json assets -q '.assets[].name')"; \
+	  upload=(); \
+	  for f in "$${files[@]}"; do \
+	    name="$$(basename "$$f")"; \
+	    if grep -qxF "$$name" <<<"$$existing" && [ "$${FORCE:-}" != "1" ]; then \
+	      echo "  skip $$name (already on release v$(VERSION); assets are immutable, FORCE=1 to overwrite)"; \
+	    else \
+	      upload+=("$$f"); \
+	    fi; \
+	  done; \
+	  if [ $${#upload[@]} -eq 0 ]; then \
+	    echo "nothing to publish: all assets already on release v$(VERSION)"; exit 0; \
+	  fi; \
+	  echo "publishing $${#upload[@]} file(s) to stackql/stackql release v$(VERSION):"; \
+	  for f in "$${upload[@]}"; do echo "  $$f"; done; \
+	  gh release upload "v$(VERSION)" "$${upload[@]}" $${FORCE:+--clobber} --repo stackql/stackql
+
+# Single-target builds: temporarily hide the other artefacts so package.sh
+# skips them. Uses a sentinel dir under bin/ so nothing leaves the tree.
+# Restores the moved artefacts even if package.sh fails.
+define build_one
+	@mkdir -p $(BIN_DIR)/.hidden
+	@find $(BIN_DIR) -maxdepth 1 -mindepth 1 \
+	  ! -name '.hidden' ! -name '.gitignore' ! -name 'README.md' \
+	  $(1) -exec mv {} $(BIN_DIR)/.hidden/ \;
+	-$(PACKAGE) --version $(VERSION)
+	@mv $(BIN_DIR)/.hidden/* $(BIN_DIR)/ 2>/dev/null || true
+	@rmdir $(BIN_DIR)/.hidden 2>/dev/null || true
+endef
+
+linux-x64: check-version
+	$(call build_one, ! -name 'stackql_linux_amd64.zip')
+
+linux-arm64: check-version
+	$(call build_one, ! -name 'stackql_linux_arm64.zip')
+
+windows-x64: check-version
+	$(call build_one, ! -name 'stackql_windows_amd64.zip')
+
+windows-arm64: check-version
+	$(call build_one, ! -name 'stackql_windows_arm64.zip')
+
+darwin-universal: check-version
+	$(call build_one, ! -name 'stackql_darwin*.pkg')
+
+list:
+	@ls -1 $(BIN_DIR) 2>/dev/null | grep -v -E '^(\.gitignore|README\.md)$$' || echo "(empty)"
+
+clean:
+	bash scripts/clean.sh
+
+clean-bin:
+	@rm -f $(addprefix $(BIN_DIR)/,$(ASSETS))
+	@echo "cleaned downloaded artefacts from $(BIN_DIR)/"
+
+# --- SDK wrappers (cargo, go, dotnet) -----------------------------------------
+# Three more wrappers on the same contract as npm/pypi: version == stackql
+# release, pins from platforms.json rendered by scripts/render-platforms.sh
+# (AFTER the .mcpb assets are on the release), download through the proxy,
+# shared cache, STACKQL_MCP_BIN / STACKQL_MCP_BUNDLE, canonical argv, gated
+# by scripts/smoke-test.py --cmd against each vector's launcher.
+#
+#   make manifests VERSION=X.Y.Z          render platforms.json + version stamps for ALL vectors
+#   make <vector>-manifest VERSION=X.Y.Z  one vector (npm|pypi|cargo|go|dotnet)
+#   make <vector>-build VERSION=X.Y.Z     lint + unit tests + package/build (what CI runs)
+#   make <vector>-smoke VERSION=X.Y.Z     scripts/smoke-test.py --cmd against the launcher
+#   make <vector>-publish VERSION=X.Y.Z   publish at exactly VERSION (idempotent where the
+#                                         registry allows); credentials from the environment:
+#                                           cargo   CARGO_REGISTRY_TOKEN
+#                                           dotnet  NUGET_API_KEY
+#                                           go      SDK_MIRROR_TOKEN (or local git auth) - mirror push + tag
+SDK_VECTORS := cargo go dotnet
+RENDER := bash scripts/render-platforms.sh
+PYTHON ?= python3
+SMOKE := $(PYTHON) scripts/smoke-test.py
+
+.PHONY: manifests $(addsuffix -manifest,$(SDK_VECTORS)) \
+        $(addsuffix -build,$(SDK_VECTORS)) $(addsuffix -smoke,$(SDK_VECTORS)) \
+        $(addsuffix -publish,$(SDK_VECTORS)) sdk-build sdk-smoke
+
+manifests: check-version
+	$(RENDER) --version $(VERSION) --vector all
+
+$(addsuffix -manifest,$(SDK_VECTORS)): %-manifest: check-version
+	$(RENDER) --version $(VERSION) --vector $*
+
+sdk-build: $(addsuffix -build,$(SDK_VECTORS))
+sdk-smoke: $(addsuffix -smoke,$(SDK_VECTORS))
+
+# cargo (crates.io: stackql-mcp)
+cargo-build: cargo-manifest
+	cd cargo && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings \
+	  && cargo test && cargo package --allow-dirty --no-verify
+cargo-smoke: cargo-manifest
+	$(SMOKE) --cmd "cargo run -q --manifest-path cargo/Cargo.toml --example launcher --"
+cargo-publish: cargo-manifest
+	@if curl -fsSL -A "stackql-mcp-packaging" "https://crates.io/api/v1/crates/stackql-mcp/$(VERSION)" >/dev/null 2>&1; then \
+	  echo "crates.io already has stackql-mcp $(VERSION) - skipping"; \
+	else \
+	  cd cargo && cargo publish --allow-dirty && echo "published https://crates.io/crates/stackql-mcp/$(VERSION)"; \
+	fi
+
+# go (mirror: github.com/stackql/stackql-mcp-go, tag v<version>)
+go-build: go-manifest
+	cd go && test -z "$$(gofmt -l .)" && go vet ./... && go build ./... && go test -short ./...
+go-smoke: go-manifest
+	$(SMOKE) --cmd "go run -C go ./cmd/stackql-mcp-launch"
+go-publish: go-manifest
+	bash scripts/publish-mirror.sh --vector go --version $(VERSION)
+
+# dotnet (NuGet: StackQL.Mcp + StackQL.Mcp.AgentFramework)
+dotnet-build: dotnet-manifest
+	cd dotnet && dotnet restore && dotnet format StackQL.Mcp.sln --verify-no-changes --no-restore \
+	  && dotnet build StackQL.Mcp.sln -c Release --no-restore -p:ContinuousIntegrationBuild=true \
+	  && dotnet test StackQL.Mcp.sln -c Release --no-build \
+	  && rm -rf artifacts \
+	  && dotnet pack src/StackQL.Mcp/StackQL.Mcp.csproj -c Release --no-build -o artifacts \
+	  && dotnet pack src/StackQL.Mcp.AgentFramework/StackQL.Mcp.AgentFramework.csproj -c Release --no-build -o artifacts
+dotnet-smoke: dotnet-manifest
+	$(SMOKE) --cmd "dotnet run -c Release --project dotnet/samples/Launcher --"
+dotnet-publish: dotnet-build
+	@[ -n "$${NUGET_API_KEY:-}" ] || { echo "error: NUGET_API_KEY not set" >&2; exit 2; }
+	cd dotnet && dotnet nuget push "artifacts/*.nupkg" --api-key "$$NUGET_API_KEY" \
+	  --source https://api.nuget.org/v3/index.json --skip-duplicate
+	@echo "published https://www.nuget.org/packages/StackQL.Mcp/$(VERSION) and StackQL.Mcp.AgentFramework/$(VERSION)"

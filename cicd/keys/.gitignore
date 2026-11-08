@@ -1,0 +1,5 @@
+*
+!.gitignore
+!integration/
+!work/
+!testing/

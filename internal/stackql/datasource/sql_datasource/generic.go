@@ -1,0 +1,97 @@
+package sql_datasource //nolint:revive,stylecheck // package name is helpful
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	_ "github.com/jackc/pgx/v5/stdlib"     //nolint:revive,nolintlint // this is a DB driver pattern
+	_ "github.com/snowflakedb/gosnowflake" //nolint:revive,nolintlint // this is a DB driver pattern
+
+	"github.com/stackql/stackql/internal/stackql/constants"
+	"github.com/stackql/stackql/internal/stackql/datasource/sqltable"
+	dto "github.com/stackql/stackql/internal/stackql/runtimeconfig"
+	db_util "github.com/stackql/stackql/internal/stackql/sqlengine/connect"
+)
+
+var (
+	_         SQLDataSource = &genericSQLDataSource{}
+	getDBFunc               = openDB //nolint:gochecknoglobals // patching variable
+)
+
+func openDB(driverName, dbName string, cfg dto.SQLBackendCfg) (*sql.DB, error) {
+	return db_util.Open(driverName, dbName, cfg.GetDSN(), cfg.InitMaxRetries, cfg.InitRetryInitialDelay)
+}
+
+func NewGenericSQLDataSource(authCtx *dto.AuthCtx, driverName string, dbName string) (SQLDataSource, error) {
+	sqlCfg, hasSQLCfg := authCtx.GetSQLCfg()
+	if !hasSQLCfg {
+		return nil, fmt.Errorf("cannot init %s data source with empty SQL config", dbName)
+	}
+	db, err := getDBFunc(driverName, dbName, sqlCfg)
+	if err != nil {
+		return nil, err
+	}
+	schemaType := sqlCfg.GetSchemaType()
+	if schemaType == "" {
+		schemaType = constants.SQLDataSourceSchemaDefault
+	}
+	return &genericSQLDataSource{
+		db:         db,
+		dbName:     dbName,
+		schemaType: schemaType,
+	}, nil
+}
+
+type genericSQLDataSource struct {
+	db         *sql.DB
+	dbName     string
+	schemaType string
+}
+
+func (ds *genericSQLDataSource) GetSchemaType() string {
+	return ds.schemaType
+}
+
+func (ds *genericSQLDataSource) GetDBName() string {
+	return ds.dbName
+}
+
+func (ds *genericSQLDataSource) Exec(query string, args ...interface{}) (sql.Result, error) {
+	return ds.db.Exec(query, args...)
+}
+
+func (ds *genericSQLDataSource) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	return ds.db.Query(query, args...)
+}
+
+func (ds *genericSQLDataSource) QueryRow(query string, args ...interface{}) *sql.Row {
+	return ds.db.QueryRow(query, args...)
+}
+
+func (ds *genericSQLDataSource) Begin() (*sql.Tx, error) {
+	return ds.db.Begin()
+}
+
+func (ds *genericSQLDataSource) GetTableMetadata(args ...string) (sqltable.SQLTable, error) {
+	return nil, fmt.Errorf("could not obtain sql data source table metadata for args = '%v'", args)
+}
+
+// func (ds *genericSQLDataSource) getPostgresTableMetadata(schemaName, tableName string) (sqltable.SQLTable, error) {
+// 	queryTemplate := `
+// 	SELECT
+// 		column_name,
+// 		data_type
+// 	FROM
+// 		information_schema.columns
+// 	WHERE
+// 		table_name = ?
+// 		AND
+// 		table_schema = ?;
+// 	`
+// 	return nil, fmt.Errorf("could not obtain sql data source table metadata for table = '%s'", tableName)
+// }
+
+func (ds *genericSQLDataSource) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return ds.db.QueryContext(ctx, query, args...)
+}

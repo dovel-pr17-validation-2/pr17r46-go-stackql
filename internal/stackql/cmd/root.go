@@ -1,0 +1,337 @@
+/*
+Copyright © 2025 stackql info@stackql.io
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+package cmd
+
+import (
+	"fmt"
+	"os"
+	"path"
+	"runtime/debug"
+	"strings"
+
+	"github.com/stackql/stackql/internal/stackql/buildinfo"
+	"github.com/stackql/stackql/internal/stackql/config"
+	"github.com/stackql/stackql/internal/stackql/constants"
+	"github.com/stackql/stackql/internal/stackql/envfile"
+	"github.com/stackql/stackql/internal/stackql/intrinsic"
+	"github.com/stackql/stackql/internal/stackql/logging"
+	"github.com/stackql/stackql/internal/stackql/output"
+	dto "github.com/stackql/stackql/internal/stackql/runtimeconfig"
+
+	"github.com/magiconair/properties"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
+
+	lrucache "github.com/stackql/stackql-parser/go/cache"
+)
+
+// Build-time identifiers. These remain exported from this package so that
+// existing -ldflags `-X github.com/stackql/stackql/internal/stackql/cmd.<var>`
+// invocations in CI/CD continue to populate them. They are published into
+// internal/stackql/buildinfo from this package's init() so that runtime
+// packages can read them without importing this command-layer package (which
+// would produce an import cycle).
+//
+//nolint:revive,gochecknoglobals // populated by -ldflags at build time
+var (
+	BuildMajorVersion     string = ""
+	BuildMinorVersion     string = ""
+	BuildPatchVersion     string = ""
+	BuildPreReleaseSuffix string = ""
+	BuildCommitSHA        string = ""
+	BuildShortCommitSHA   string = ""
+	BuildDate             string = ""
+	BuildPlatform         string = ""
+)
+
+func getSemver() string {
+	return "v" + buildinfo.Get().GetSemVersion()
+}
+
+const (
+	defaultRegistryURLString string = "https://registry.stackql.app/providers"
+)
+
+//nolint:revive,gochecknoglobals // global vars are a pattern for this lib
+var (
+	runtimeCtx      dto.RuntimeCtx
+	queryCache      *lrucache.LRUCache
+	replicateCtrMgr bool = false //nolint:unused // TODO: investigate and test then remove if possible
+)
+
+// previewCfgRaw is the raw --preview argument; cobra binds it here and
+// initConfig hands it to the intrinsic package once.
+//
+//nolint:gochecknoglobals // cobra binds flags to package scope
+var previewCfgRaw string
+
+// otelConfigRaw is the raw --otel.config argument; initConfig hands it to
+// the output package once.
+//
+//nolint:gochecknoglobals // cobra binds flags to package scope
+var otelConfigRaw string
+
+// rootCmd represents the base command when called without any subcommands.
+//
+//nolint:gochecknoglobals // global vars are a pattern for this lib
+var rootCmd = &cobra.Command{
+	Use: "stackql",
+	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+		if runtimeCtx.AccessConfigFile == "" {
+			return nil
+		}
+		switch cmd.Name() {
+		case "stackql", "exec", "shell", "srv", "mcp", "version":
+			return nil
+		}
+		return fmt.Errorf("caller access: this command is not integrated with caller authorization")
+	},
+	Short: "Cloud asset management and automation using SQL",
+	Long: `
+         __             __         __
+   _____/ /_____ ______/ /______ _/ /
+  / ___/ __/ __  / ___/ //_/ __  / / 
+ (__  ) /_/ /_/ / /__/ ,< / /_/ / /  
+/____/\__/\__,_/\___/_/|_|\__, /_/   
+                            /_/      
+Cloud asset management and automation using SQL. For example:
+
+SELECT name, status FROM google.compute.instances
+WHERE project = 'my-project' AND zone = 'us-west1-b';`,
+	//nolint:revive // acceptable for now
+	Run: func(cmd *cobra.Command, args []string) {
+		// in the root command is executed with no arguments, print the help message
+		usagemsg := cmd.Long + "\n\n" + cmd.UsageString()
+		fmt.Println(usagemsg) //nolint:forbidigo // legacy
+	},
+}
+
+func dependentFlagHandler(rc *dto.RuntimeCtx) error {
+	inferredReqistryRaw := fmt.Sprintf(
+		`{ "url": "%s", "localDocRoot": "%s", "verifyConfig": { "nopVerify": true } }`,
+		defaultRegistryURLString,
+		strings.ReplaceAll(path.Join(runtimeCtx.ApplicationFilesRootPath), `\`, `\\`),
+	)
+	if rc.RegistryRaw == "" {
+		setErr := rc.Set(
+			dto.RegistryRawKey,
+			inferredReqistryRaw,
+		)
+		if setErr != nil {
+			return setErr
+		}
+	}
+	return nil
+}
+
+// Execute adds all child commands to the root command and sets flags appropriately.
+// This is called by main.main(). It only needs to happen once to the rootCmd.
+func Execute() error {
+	return rootCmd.Execute()
+}
+
+// vcsBuildDate reports the module's vcs.time when the linker did not stamp
+// BuildDate (issue #704), so local builds still carry a build date.
+func vcsBuildDate() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "vcs.time" {
+			return setting.Value
+		}
+	}
+	return ""
+}
+
+//nolint:lll,funlen,gochecknoinits,mnd // init is a pattern for this lib
+func init() {
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.AllowPersistentSecrets, "allow-persistent-secrets", false,
+		"Allow persistent OS secret stores (disabled by default)")
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.AllowSecretDereference, "allow-secret-dereference", false,
+		"Allow secret values in SQL expressions, results and execution artifacts")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.AccessConfigFile, "access.config", "", "Caller access configuration: JSON {\"path\":\"/path/to/access.json\"}; token credentials use STACKQL_CALLER_TOKEN locally")
+	buildDate := BuildDate
+	if buildDate == "" {
+		buildDate = vcsBuildDate()
+	}
+	buildinfo.Init(
+		BuildMajorVersion,
+		BuildMinorVersion,
+		BuildPatchVersion,
+		BuildPreReleaseSuffix,
+		BuildCommitSHA,
+		BuildShortCommitSHA,
+		buildDate,
+		BuildPlatform,
+	)
+	bi := buildinfo.Get()
+	rootCmd.Version = bi.GetSemVersion()
+	cobra.OnInitialize(initConfig)
+	rootCmd.SetVersionTemplate("stackql v{{.Version}} " + bi.GetPlatform() + " (" + bi.GetShortCommitSHA() + ")\nBuildDate: " + bi.GetDate() + "\nhttps://stackql.io\n")
+
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.CPUProfile, dto.CPUProfileKey, "", "cpuprofile file, none if empty")
+
+	// Here you will define your flags and configuration settings.
+	// Cobra supports persistent flags, which, if defined here,
+	// will be global for your application.
+
+	var dummyString string
+
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.DBInternalCfgRaw, dto.DBInternalCfgRawKey, "{}", "JSON / YAML string to configure DBMS housekeeping query handling")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.SQLBackendCfgRaw, dto.SQLBackendCfgRawKey, "{}", "JSON / YAML string representing SQL Backend System Config")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.NamespaceCfgRaw, dto.NamespaceCfgRawKey, "{}", "JSON / YAML string representing namespaces for cacheing, views etc")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.StoreTxnCfgRaw, dto.StoreTxnCfgRawKey, "{}", "JSON / YAML string representing Txn store config")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.GCCfgRaw, dto.GCCfgRawKey, "{}", "JSON / YAML string representing GC config")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.UpstreamErrorCfgRaw, dto.UpstreamErrorCfgRawKey, "{}", `JSON / YAML string representing upstream errors that reads ignore, eg {"http": {"ignoreStatusCodes": ["5xx"]}}`)
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.ACIDCfgRaw, dto.ACIDCfgRawKey, "{}", "JSON / YAML string representing ACID config")
+	rootCmd.PersistentFlags().StringVar(&previewCfgRaw, intrinsic.CfgRawKey, "{}", "JSON string configuring the "+intrinsic.ProviderName+
+		" provider backend; keys: batchSize, flushInterval, endpoint, unstable")
+	rootCmd.PersistentFlags().StringVar(&otelConfigRaw, output.OTelConfigKey, "{}", "JSON / YAML string configuring the otel output format, "+
+		`eg: '{ "exporter": { "endpoint": "http://localhost:4318/v1/logs", "headers": { "authorization": "<token>" } } }'`)
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.SessionCtxRaw, dto.SessionCtxKey, "{}", "JSON / YAML string representing session config")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.APIRequestTimeout, dto.APIRequestTimeoutKey, 45, "API request timeout in seconds, 0 for no timeout.") //nolint:mnd // TODO: investigate
+	rootCmd.PersistentFlags().StringVar(&dummyString, dto.ColorSchemeKey, "", "DEPRECATED: color schems no longer active")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.CABundle, dto.CABundleKey, "", "Path to CA bundle, if not specified then system defaults used.")
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.AllowInsecure, dto.AllowInsecureKey, false, "Allow trust of insecure certificates (not recommended)")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.ConfigFilePath, dto.ConfigFilePathKey, config.GetDefaultConfigFilePath(), "Config file full path; defaults to current dir")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.ApplicationFilesRootPath, dto.ApplicationFilesRootPathKey, config.GetDefaultApplicationFilesRoot(), "Application config and cache root path")
+	rootCmd.PersistentFlags().Uint32Var(&runtimeCtx.ApplicationFilesRootPathMode, dto.ApplicationFilesRootPathModeKey, config.GetDefaultProviderCacheDirFileMode(), "Application config and cache file mode")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.ViperCfgFileName, dto.ViperCfgFileNameKey, config.GetDefaultViperConfigFileName(), "Config filename")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.AuthRaw, dto.AuthCtxKey, "", `auth contexts keyvals in json form, eg: '{ "google": { "credentialsfilepath": "/path/to/google/sevice/account/key.json",  "type": "service_account" }, "okta": { "credentialsenvvar": "OKTA_SECRET_KEY",  "type": "api_key" } }'`)
+	rootCmd.PersistentFlags().StringVar(
+		&runtimeCtx.RegistryRaw,
+		dto.RegistryRawKey,
+		"",
+		fmt.Sprintf(`openapi registry context keyvals in json form, eg: '{ "url": "%s" }'.`, defaultRegistryURLString),
+	)
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.HTTPLogEnabled, dto.HTTPLogEnabledKey, false, "Display http request info in terminal")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.HTTPMaxResults, dto.HTTPMaxResultsKey, -1, "Max results per http request, any number <=0 results in no limitation")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.HTTPPageLimit, dto.HTTPPAgeLimitKey, 20, "Max pages of results that will be returned per resource, any number <=0 results in no limitation") //nolint:mnd // TODO: investigate
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.HTTPProxyPort, dto.HTTPProxyPortKey, -1, "http proxy port, any number <=0 will result in the default port for a given scheme (eg: http -> 80)")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.ExecutionConcurrencyLimit, dto.ExecutionConcurrencyLimitKey, 1, "concurrency limit for query execution")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.IndirectDepthMax, dto.IndirectDepthMaxKey, 5, "max depth for indirect queries: views and subqueries") //nolint:mnd // TODO: investigate
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.DataflowDependencyMax, dto.DataflowDependencyMaxKey, 50, "max dataflow dependency depth for a given query")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.DataflowComponentsMax, dto.DataflowComponentsMaxKey, 50, "max dataflow weakly connected components for a given query")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.HTTPProxyHost, dto.HTTPProxyHostKey, "", "http proxy host, empty means no proxy")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.HTTPProxyScheme, dto.HTTPProxySchemeKey, "http", "http proxy scheme, eg 'http'")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.HTTPProxyPassword, dto.HTTPProxyPasswordKey, "", "http proxy password")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.HTTPProxyUser, dto.HTTPProxyUserKey, "", "http proxy user")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.ProviderStr, dto.ProviderStrKey, "", "stackql provider")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.ExportAlias, dto.ExportAliasKey, "", "export alias prefix (namespace or schema)")
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.PGSrvIsDebugNoticesEnabled, dto.PgSrvIsDebugNoticesEnabledKey, false, "Publish debug notices to clients, for server mode only")
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.WorkOffline, dto.WorkOfflineKey, false, "Work offline, using cached data")
+	rootCmd.PersistentFlags().BoolVarP(&runtimeCtx.VerboseFlag, dto.VerboseFlagKey, "v", false, "Verbose flag")
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.DryRunFlag, dto.DryRunFlagKey, false, "dryrun flag; preprocessor only will run and output returned")
+	rootCmd.PersistentFlags().BoolVarP(&runtimeCtx.CSVHeadersDisable, dto.CSVHeadersDisableKey, "H", false, "Disable CSV headers flag")
+	rootCmd.PersistentFlags().StringVarP(&runtimeCtx.OutputFormat, dto.OutputFormatKey, "o", "table", "Output format, must be (json | jsonl | table | csv | text | otel)")
+	rootCmd.PersistentFlags().StringVarP(&runtimeCtx.OutfilePath, dto.OutfilePathKey, "f", "stdout", "Output file into which results are written")
+	rootCmd.PersistentFlags().StringVarP(&runtimeCtx.InfilePath, dto.InfilePathKey, "i", "stdin", "Input file from which queries are read")
+	rootCmd.PersistentFlags().StringVarP(&runtimeCtx.TemplateCtxFilePath, dto.TemplateCtxFilePathKey, "q", "", "Context file for templating")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.QueryCacheSize, dto.QueryCacheSizeKey, constants.DefaultQueryCacheSize, "Size in number of entries of LRU cache for query plans")
+	rootCmd.PersistentFlags().StringVarP(&runtimeCtx.Delimiter, dto.DelimiterKey, "d", ",", "Delimiter for csv output;  single character only, ignored for all non-csv output")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.CacheKeyCount, dto.CacheKeyCountKey, 100, "Cache initial key count")              //nolint:mnd // TODO: investigate
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.CacheTTL, dto.CacheTTLKey, 3600, "TTL for cached metadata documents, in seconds") //nolint:mnd // TODO: investigate
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.TestWithoutAPICalls, dto.TestWithoutAPICallsKey, false, "Flag to omit api calls for testing")
+	rootCmd.PersistentFlags().BoolVar(&runtimeCtx.UseNonPreferredAPIs, dto.UseNonPreferredAPIsKEy, false, "Flag to enable non-preferred APIs")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.LogLevelStr, dto.LogLevelStrKey, config.GetDefaultLogLevelString(), "Log level")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.ErrorPresentation, dto.ErrorPresentationKey, config.GetDefaultErrorPresentationString(), `Error presentation, options are: {"stderr", "record"}`)
+
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.PGSrvAddress, dto.PgSrvAddressKey, "0.0.0.0", "server address, for server mode only")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.PGSrvLogLevel, dto.PgSrvLogLevelKey, "WARN", "Log level, for server mode only")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.PGSrvRawTLSCfg, dto.PgSrvRawTLSCfgKey, "", "tls config for server, for server mode only")
+	rootCmd.PersistentFlags().StringVar(&runtimeCtx.PGSrvRawSrvCfg, dto.PgSrvRawSrvCfgKey, "{}", "miscellaneous config for server, for server mode only")
+	rootCmd.PersistentFlags().IntVar(&runtimeCtx.PGSrvPort, dto.PgSrvPortKey, 5466, "TCP server port, for server mode only") //nolint:mnd // TODO: investigate
+
+	rootCmd.PersistentFlags().StringSliceVar(&runtimeCtx.VarList, dto.VarListKey, []string{}, "list of variables to be used in queries")
+
+	rootCmd.PersistentFlags().MarkHidden(dto.TestWithoutAPICallsKey) //nolint:errcheck // TODO: investigate
+	rootCmd.PersistentFlags().MarkHidden(dto.ViperCfgFileNameKey)    //nolint:errcheck // TODO: investigate
+	rootCmd.PersistentFlags().MarkHidden(dto.ErrorPresentationKey)   //nolint:errcheck // TODO: investigate
+
+	// Cobra also supports local flags, which will only run
+	// when this action is called directly.
+	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+
+	queryCache = lrucache.NewLRUCache(int64(runtimeCtx.QueryCacheSize))
+
+	rootCmd.CompletionOptions.DisableDefaultCmd = true
+	rootCmd.AddCommand(execCmd)
+	rootCmd.AddCommand(shellCmd)
+	rootCmd.AddCommand(registryCmd)
+	rootCmd.AddCommand(srvCmd)
+	rootCmd.AddCommand(mcpSrvCmd)
+
+	rootCmd.PersistentFlags().StringVar(&mcpConfig, "mcp.config", "{}", "MCP server config as an inline JSON object (not a file path)")
+	rootCmd.PersistentFlags().StringVar(&mcpServerType, "mcp.server.type", "", "MCP server type (http or stdio for now)")
+	rootCmd.PersistentFlags().StringVar(&mcpLogFormat, "mcp.log.format", "", "MCP audit log format: jsonl (default) or otel (OTLP/JSON log records); overrides server.audit.format in mcp.config")
+	rootCmd.PersistentFlags().StringVar(&mcpProtocolVersion, "mcp.protocol.version", "", "newest MCP protocol revision advertised: auto (default, every SDK revision), 2026-07-28 (sessionless only; implies stateless HTTP) or an older revision such as 2025-11-25 (that revision and earlier); overrides server.protocol_version in mcp.config")
+	rootCmd.PersistentFlags().StringVar(&envFilePath, "env.file", "", "optional dotenv-style file sourced into the process environment at startup, created empty if absent; the MCP reload_credentials tool re-sources it on demand")
+}
+
+func mergeConfigFromFile(runtimeCtx *dto.RuntimeCtx, flagSet pflag.FlagSet) {
+	props, err := properties.LoadFile(runtimeCtx.ConfigFilePath, properties.UTF8)
+	if err == nil {
+		propertiesMap := props.Map()
+		for k, v := range propertiesMap {
+			if flagSet.Lookup(k) != nil && !flagSet.Lookup(k).Changed {
+				runtimeCtx.Set(k, v) //nolint:errcheck // TODO: investigate
+			}
+		}
+	}
+}
+
+// initConfig reads in config file and ENV variables if set.
+func initConfig() {
+	mergeConfigFromFile(&runtimeCtx, *rootCmd.PersistentFlags())
+
+	intrinsic.Init(previewCfgRaw)
+	if err := output.InitOTelConfig(otelConfigRaw); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid --%s: %v\n", output.OTelConfigKey, err)
+		os.Exit(1)
+	}
+
+	// An absent --env.file is created empty (issue #691) so packaged installs
+	// have a credential store to populate; creation failure is non-fatal
+	// because a missing file is already tolerated by Source.
+	if created, err := envfile.EnsureExists(envFilePath); err != nil {
+		fmt.Fprintf(os.Stderr, "could not create default env file '%s': %v\n", envFilePath, err)
+	} else if created {
+		fmt.Fprintf(os.Stderr, "created default env file '%s'\n", envFilePath)
+	}
+	// Source --env.file before anything credential-bearing runs; a missing
+	// file is fine (it may be written later), a malformed one is fatal.
+	if _, _, err := envfile.Source(envFilePath); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to source env file '%s': %v\n", envFilePath, err)
+		os.Exit(1)
+	}
+
+	logging.SetLogger(runtimeCtx.LogLevelStr)
+	config.CreateDirIfNotExists(runtimeCtx.ApplicationFilesRootPath, os.FileMode(runtimeCtx.ApplicationFilesRootPathMode))                                    //nolint:errcheck,lll // TODO: investigate
+	config.CreateDirIfNotExists(path.Join(runtimeCtx.ApplicationFilesRootPath, runtimeCtx.ProviderStr), os.FileMode(runtimeCtx.ApplicationFilesRootPathMode)) //nolint:errcheck,lll // TODO: investigate
+	config.CreateDirIfNotExists(config.GetReadlineDirPath(runtimeCtx), os.FileMode(runtimeCtx.ApplicationFilesRootPathMode))                                  //nolint:errcheck,lll // TODO: investigate
+	viper.SetConfigFile(path.Join(runtimeCtx.ApplicationFilesRootPath, runtimeCtx.ViperCfgFileName))
+	viper.AddConfigPath(runtimeCtx.ApplicationFilesRootPath)
+
+	viper.AutomaticEnv() // read in environment variables that match
+
+	// If a config file is found, read it in.
+	if err := viper.ReadInConfig(); err == nil {
+		fmt.Println("Using config file:", viper.ConfigFileUsed()) //nolint:forbidigo // legacy
+	}
+}

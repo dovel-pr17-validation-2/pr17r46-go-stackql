@@ -1,0 +1,11 @@
+MethodName,RequiredParams,SQLVerb
+get,bucket,SELECT
+list,project,SELECT
+insert,"project, data__name",INSERT
+delete,bucket,DELETE
+patch,bucket,UPDATE
+update,"bucket, data__acl",UPDATE
+getIamPolicy,bucket,EXEC
+lockRetentionPolicy,"bucket, ifMetagenerationMatch",EXEC
+setIamPolicy,"bucket, data__bindings",EXEC
+testIamPermissions,"bucket, permissions",EXEC

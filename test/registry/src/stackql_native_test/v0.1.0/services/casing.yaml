@@ -1,0 +1,479 @@
+openapi: 3.0.3
+servers:
+  - url: http://localhost:1070
+info:
+  version: v0.1.0
+  title: Native casing testing
+  description: |-
+    Exercises any-sdk request.nativeCasing reverse-resolution. The method declares
+    PascalCase wire parameters/body fields; stackql resolves the snake_case SQL keys
+    back to the wire form via the public GetParameter path. The flask echo mock
+    returns the raw query string and received body so tests can assert the wire casing.
+components:
+  parameters:
+    VpcId:
+      in: query
+      name: VpcId
+      required: false
+      schema:
+        type: string
+    SubnetId:
+      in: query
+      name: SubnetId
+      required: false
+      schema:
+        type: string
+    IPProtocol:
+      in: query
+      name: IPProtocol
+      required: false
+      schema:
+        type: string
+  schemas:
+    echo_response:
+      type: object
+      properties:
+        VpcId:
+          type: string
+        SubnetId:
+          type: string
+        echoed_query:
+          type: string
+    create_body:
+      type: object
+      properties:
+        DisplayName:
+          type: string
+        OwnerId:
+          type: string
+        storageClass:
+          type: string
+    create_response:
+      type: object
+      properties:
+        echoed_body:
+          type: string
+        ok:
+          type: boolean
+    header_echo_response:
+      type: object
+      properties:
+        echoed_org:
+          type: string
+        echoed_query:
+          type: string
+    echo_query_only_response:
+      type: object
+      properties:
+        echoed_query:
+          type: string
+    bodyless_echo_response:
+      type: object
+      properties:
+        BinaryId:
+          type: string
+        VpcId:
+          type: string
+        echoed_query:
+          type: string
+    activate_body:
+      type: object
+      properties:
+        reason:
+          type: string
+    activate_response:
+      type: object
+      properties:
+        status:
+          type: string
+        requestId:
+          type: string
+  x-stackQL-resources:
+    access_keys:
+      id: stackql_native_test.casing.access_keys
+      name: access_keys
+      methods:
+        select:
+          operation: {$ref: '#/paths/~1casing~1access_keys/get'}
+          request: {nativeCasing: pascal}
+          response: {mediaType: application/json, objectKey: $.items}
+      sqlVerbs:
+        select: [{$ref: '#/components/x-stackQL-resources/access_keys/methods/select'}]
+    access_key_last_useds:
+      id: stackql_native_test.casing.access_key_last_useds
+      name: access_key_last_useds
+      methods:
+        select:
+          operation: {$ref: '#/paths/~1casing~1access_key_last_used/get'}
+          request: {nativeCasing: pascal}
+          response: {mediaType: application/json, objectKey: $}
+      sqlVerbs:
+        select: [{$ref: '#/components/x-stackQL-resources/access_key_last_useds/methods/select'}]
+    echo:
+      id: stackql_native_test.casing.echo
+      name: echo
+      title: Echo of the wire request, for casing assertions
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1casing~1echo/get'
+          request:
+            mediaType: application/json
+            nativeCasing: pascal
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: $
+        insert:
+          operation:
+            $ref: '#/paths/~1casing~1echo/post'
+          request:
+            nativeCasing: pascal
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: $
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/echo/methods/select'
+        insert:
+          - $ref: '#/components/x-stackQL-resources/echo/methods/insert'
+        delete: []
+        update: []
+    echo_strict:
+      id: stackql_native_test.casing.echo_strict
+      name: echo_strict
+      title: Echo with a REQUIRED PascalCase wire parameter (routing reverse-casing)
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1casing~1echo_strict/get'
+          request:
+            nativeCasing: pascal
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: $
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/echo_strict/methods/select'
+        insert: []
+        delete: []
+        update: []
+    echo_wire:
+      id: stackql_native_test.casing.echo_wire
+      name: echo_wire
+      title: Echo with NO request.nativeCasing (wire names presented as declared)
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1casing~1echo_strict/get'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: $
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/echo_wire/methods/select'
+        insert: []
+        delete: []
+        update: []
+    echo_request_only:
+      id: stackql_native_test.casing.echo_request_only
+      name: echo_request_only
+      title: Echo with a required parameter absent from the response schema
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1casing~1echo_strict/get'
+          request:
+            nativeCasing: pascal
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            overrideMediaType: application/json
+            objectKey: $
+            schema_override:
+              $ref: '#/components/schemas/echo_query_only_response'
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/echo_request_only/methods/select'
+        insert: []
+        delete: []
+        update: []
+    echo_filter:
+      id: stackql_native_test.casing.echo_filter
+      name: echo_filter
+      title: Echo a single-word native-cased required parameter
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1casing~1echo_filter/get'
+          request:
+            nativeCasing: pascal
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            overrideMediaType: application/json
+            objectKey: $
+            schema_override:
+              $ref: '#/components/schemas/echo_query_only_response'
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/echo_filter/methods/select'
+        insert: []
+        delete: []
+        update: []
+    echo_header:
+      id: stackql_native_test.casing.echo_header
+      name: echo_header
+      title: Echo of a kebab-case wire header (hyphenated snake aliasing, any-sdk #119)
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1casing~1echo_header/get'
+          request:
+            nativeCasing: kebab
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: $
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/echo_header/methods/select'
+        insert: []
+        delete: []
+        update: []
+    echo_bodyless:
+      id: stackql_native_test.casing.echo_bodyless
+      name: echo_bodyless
+      title: Body-less EXEC method carrying a metadata-only request block
+      methods:
+        exec_by_id:
+          operation:
+            $ref: '#/paths/~1casing~1echo_bodyless~1{BinaryId}/get'
+          request:
+            nativeCasing: pascal
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: $
+      sqlVerbs:
+        select: []
+        insert: []
+        delete: []
+        update: []
+    activate:
+      id: stackql_native_test.casing.activate
+      name: activate
+      title: EXEC whose 200 schema lacks the exec parameter (stackql #705 / #726)
+      methods:
+        activate:
+          operation:
+            $ref: '#/paths/~1casing~1activate~1{id}/post'
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: $
+      sqlVerbs:
+        select: []
+        insert: []
+        delete: []
+        update: []
+    echo_post:
+      id: stackql_native_test.casing.echo_post
+      name: echo_post
+      title: POST echo exercising the request.base fallback body (aws-json '{}' pattern)
+      methods:
+        select:
+          operation:
+            $ref: '#/paths/~1casing~1echo/post'
+          request:
+            mediaType: application/json
+            base: '{}'
+            nativeCasing: pascal
+          response:
+            mediaType: application/json
+            openAPIDocKey: '200'
+            objectKey: $
+      sqlVerbs:
+        select:
+          - $ref: '#/components/x-stackQL-resources/echo_post/methods/select'
+        insert: []
+        delete: []
+        update: []
+paths:
+  /casing/echo:
+    get:
+      operationId: casing/echo/get
+      parameters:
+        - $ref: '#/components/parameters/VpcId'
+        - $ref: '#/components/parameters/SubnetId'
+        - $ref: '#/components/parameters/IPProtocol'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/echo_response'
+      servers:
+        - url: http://localhost:1070
+      summary: Echo received query parameters
+    post:
+      operationId: casing/echo/post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/create_body'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/create_response'
+      servers:
+        - url: http://localhost:1070
+      summary: Echo received request body
+  /casing/echo_strict:
+    get:
+      operationId: casing/echo_strict/get
+      parameters:
+        - in: query
+          name: VpcId
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/SubnetId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/echo_response'
+      servers:
+        - url: http://localhost:1070
+      summary: Echo received query parameters, VpcId required
+  /casing/echo_filter:
+    get:
+      operationId: casing/echo_filter/get
+      parameters:
+        - in: query
+          name: Filter
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  echoed_query:
+                    type: string
+      servers:
+        - url: http://localhost:1070
+  /casing/echo_header:
+    get:
+      operationId: casing/echo_header/get
+      parameters:
+        - in: header
+          name: openai-organization
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/header_echo_response'
+      servers:
+        - url: http://localhost:1070
+      summary: Echo the openai-organization request header
+  /casing/echo_bodyless/{BinaryId}:
+    get:
+      operationId: casing/echo_bodyless/get
+      parameters:
+        - in: path
+          name: BinaryId
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/VpcId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/bodyless_echo_response'
+      servers:
+        - url: http://localhost:1070
+      summary: Echo the path parameter and query, no request body
+  /casing/activate/{id}:
+    post:
+      operationId: casing/activate/post
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/activate_body'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/activate_response'
+      servers:
+        - url: http://localhost:1070
+      summary: Lifecycle action whose response omits the id
+  /casing/access_keys:
+    get:
+      parameters:
+        - {in: query, name: region, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        UserName: {type: string}
+                        AccessKeyId: {type: string}
+                        Status: {type: string}
+  /casing/access_key_last_used:
+    get:
+      parameters:
+        - {in: query, name: region, required: true, schema: {type: string}}
+        - {in: query, name: AccessKeyId, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  LastUsedDate: {type: string, nullable: true}
+                  Region: {type: string}

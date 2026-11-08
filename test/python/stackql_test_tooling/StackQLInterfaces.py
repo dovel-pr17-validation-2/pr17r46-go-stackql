@@ -1,0 +1,1535 @@
+
+
+from asyncio import subprocess
+import json
+import os
+import re
+import sys
+import time
+import typing
+
+from robot.api.deco import keyword, library
+from robot.libraries.BuiltIn import BuiltIn
+from robot.libraries.Collections import Collections
+from robot.libraries.Process import Process
+
+from robot.libraries.OperatingSystem import OperatingSystem 
+
+from .registry_cfg import RegistryCfg
+from .ShellSession import ShellSession
+from .psycopg_client import PsycoPGClient
+from .psycopg2_client import PsycoPG2Client
+from .sqlalchemy_client import SQLAlchemyClient
+from .sqlite_exe_locate import resolve_sqlite_exe
+
+
+# STACKQL_ROBOT_DEFAULT_PREVIEW, when set, is a --preview value every stackql run takes unless the
+# test passes its own: the whole suite run with the document-driven (omnisdk) paths opted in.
+DEFAULT_PREVIEW_ENV_VAR = 'STACKQL_ROBOT_DEFAULT_PREVIEW'
+
+
+def _with_default_preview(args) -> tuple:
+  default = os.environ.get(DEFAULT_PREVIEW_ENV_VAR, '')
+  if default == '' or any(type(a) == str and a.startswith('--preview=') for a in args):
+    return tuple(args)
+  return tuple(args) + (f'--preview={default}',)
+
+SQL_BACKEND_CANONICAL_SQLITE_EMBEDDED :str = 'sqlite_embedded'
+SQL_BACKEND_POSTGRES_TCP :str = 'postgres_tcp'
+SQL_CONCURRENCT_LIMIT_DEFAULT :int = 1
+
+_TEST_APP_CACHE_ROOT = os.path.join("test", ".stackql")
+
+PSQL_EXE :str = os.environ.get('PSQL_EXE', 'psql')
+SQLITE_EXE :str = resolve_sqlite_exe(os.environ.get('SQLITE_EXE', 'sqlite3'))
+
+
+@library(scope='SUITE', version='0.1.0', doc_format='reST')
+class StackQLInterfaces(OperatingSystem, Process, BuiltIn, Collections):
+  ROBOT_LISTENER_API_VERSION = 2
+
+  def __init__(self, execution_platform='native', sql_backend=SQL_BACKEND_CANONICAL_SQLITE_EMBEDDED, concurrency_limit=SQL_CONCURRENCT_LIMIT_DEFAULT):
+    self._counter = 0
+    self._execution_platform=execution_platform
+    self._sql_backend=sql_backend
+    self._concurrency_limit=concurrency_limit
+    self.ROBOT_LIBRARY_LISTENER = self
+    Process.__init__(self)
+
+  def _end_suite(self, name, attrs):
+    print('Suite %s (%s) ending.' % (name, attrs['id']))
+
+  def count(self):
+    self._counter += 1
+    print(self._counter)
+
+  def clear_counter(self):
+    self._counter = 0
+
+
+  def _run_PG_client_command(self, curdir :str, psql_exe :str, psql_conn_str :str, query :str, *args, **cfg):
+    _mod_conn =  psql_conn_str.replace("\\", "/")
+    # bi = BuiltIn().get_library_instance('Builtin')
+    self.log_to_console(f"curdir = '{curdir}'")
+    self.log_to_console(f"psql_exe = '{psql_exe}'")
+    result = super().run_process(
+      psql_exe, 
+      '-d', _mod_conn, 
+      '-c', query,
+      *args,
+      **cfg,
+    )
+    self.log(result.stdout)
+    self.log(result.stderr)
+    return result
+  
+  @keyword
+  def should_rdbms_query_return_csv_result(
+    self,
+    db_name :str,
+    sql_client_export_connection_arg :str,
+    query :str,
+    expected_output :str,
+    expected_stderr_output :str,
+    *args,
+    **kwargs):
+    collapse_spaces = kwargs.pop('collapse_spaces', False)
+    strip_spaces = kwargs.pop('strip_spaces', False)
+    result = None
+    if db_name == "sqlite":
+      result = self._run_sqlite_command(
+        SQLITE_EXE,
+        sql_client_export_connection_arg,
+        query,
+        *("--csv",),
+        **kwargs,
+      )
+    elif db_name == "postgres":
+      result = self._run_PG_client_command(
+        os.getcwd(),
+        PSQL_EXE,
+        sql_client_export_connection_arg,
+        query,
+        *("--csv",),
+        **kwargs,
+      )
+    return self._verify_both_streams(
+      result, 
+      expected_output, 
+      expected_stderr_output, 
+      collapse_spaces=collapse_spaces,
+      strip_spaces=strip_spaces, 
+      **kwargs,
+    )
+  
+
+  @keyword
+  def application_stderr(self, stderr: str) -> str:
+    if self._execution_platform != "docker":
+      return stderr
+    # Compose shares stderr with StackQL. Filter only recognized launcher
+    # warnings/status lines so application errors still fail assertions.
+    compose_line = re.compile(
+      r'^time="[^"]+" level=warning msg="(?:'
+      r'The .* variable is not set\. Defaulting to a blank string\.'
+      r'|[^"\n]*docker-compose\.ya?ml: the attribute .*version.* is obsolete,.*)"$'
+      r'|^ (?:Container|Network|Volume) \S+ +'
+      r'(?:Running|Creating|Created|Starting|Started|Waiting|Healthy|Stopping|Stopped|Removing|Removed)$')
+    return "\n".join(line for line in stderr.splitlines() if not compose_line.fullmatch(line))
+
+  def _verify_both_streams(self, result, expected_output, expected_stderr_output, **cfg):
+    pass_through = {
+      'strip_spaces': cfg.pop('strip_spaces', False),
+      'collapse_spaces': cfg.pop('collapse_spaces', False)
+    }
+    stdout_ok = self.should_be_equal(result.stdout, expected_output, **pass_through)
+    if cfg.pop('unordered_http_diagnostics', False):
+      records = lambda text: sorted(part.strip() for part in re.split(r'(?m)(?=^http response status code:)', text) if part.strip())
+      actual_stderr = self.application_stderr(result.stderr)
+      stderr_ok = self.should_be_equal(records(actual_stderr), records(expected_stderr_output))
+      return stdout_ok and stderr_ok
+    if self._execution_platform == "docker":
+      # cannot silence stupid compose status logs
+      stderr_ok = self.should_contain(result.stderr, expected_stderr_output, **pass_through)
+      return stdout_ok and stderr_ok
+    stderr_ok = self.should_be_equal(result.stderr, expected_stderr_output, **pass_through)
+    return stdout_ok and stderr_ok
+  
+  def _contain_both_streams(self, result, expected_output, expected_stderr_output):
+    stdout_ok = self.should_contain(result.stdout, expected_output)
+    stderr_ok = self.should_contain(result.stderr, expected_stderr_output)
+    return stdout_ok and stderr_ok
+
+  def _run_sqlite_command(self, sqlite_exe :str, sqlite_db_file :str, query :str, *args, **cfg):
+    self.log_to_console(f"sqlite_exe = '{sqlite_exe}'")
+    result = None
+    if len(args) == 0:
+      result = super().run_process(
+        sqlite_exe,
+        sqlite_db_file, 
+        query,
+        **cfg,
+      )
+    else:
+      result = super().run_process(
+        sqlite_exe,
+        *args,
+        sqlite_db_file, 
+        query,
+        **cfg,
+      )
+    self.log(result.stdout)
+    self.log(result.stderr)
+    return result
+
+  def _run_stackql_exec_command(
+    self,  
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query,
+    *args,
+    **cfg
+  ):
+    if self._execution_platform == 'docker':
+      return self._run_stackql_exec_command_docker(
+        okta_secret_str,
+        github_secret_str,
+        k8s_secret_str,
+        registry_cfg, 
+        auth_cfg_str, 
+        sql_backend_cfg_str,
+        query,
+        *args,
+        **cfg
+      )
+    return self._run_stackql_exec_command_native(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      query,
+      *args,
+      **cfg
+    )
+
+
+  def _run_stackql_shell_command(
+    self,  
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    queries :typing.Iterable[str],
+    *args,
+    **cfg
+  ):
+    if self._execution_platform == 'docker':
+      return self._run_stackql_shell_command_docker(
+        okta_secret_str,
+        github_secret_str,
+        k8s_secret_str,
+        registry_cfg, 
+        auth_cfg_str,
+        sql_backend_cfg_str, 
+        queries,
+        *args,
+        **cfg
+      )
+    return self._run_stackql_shell_command_native(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      queries,
+      *args,
+      **cfg
+    )
+
+  def _expand_docker_env_args(self, okta_secret_str :str, github_secret_str :str, k8s_secret_str :str, *args) -> typing.Iterable:
+    rv = [
+      "-e",
+      f"OKTA_SECRET_KEY={okta_secret_str}", 
+      "-e",
+      f"GITHUB_SECRET_KEY={github_secret_str}",
+      "-e",
+      f"K8S_SECRET_KEY={k8s_secret_str}",
+    ]
+    for k, v in self._get_default_env().items():
+      rv.append("-e")
+      rv.append(f"{k}={v}")
+    return rv
+
+  def _docker_transform_args(self, *args) -> typing.Iterable:
+    rv = [ f"--namespaces='{b[13:]}'" if type(b) == str and b.startswith('--namespaces=') else b for b in list(args) ]
+    rv = [ f"--sqlBackend='{b[13:]}'" if type(b) == str and b.startswith('--sqlBackend=') else b for b in list(rv) ]
+    rv = [ f"--export.alias='{b[15:]}'" if type(b) == str and b.startswith('--export.alias=') else b for b in list(rv) ]
+    # the docker command is a bash -c string, so a bare ';' delimiter would end it
+    rv = [ f"--delimiter='{b[12:]}'" if type(b) == str and b.startswith('--delimiter=') else b for b in list(rv) ]
+    rv = [ f"--http.log.enabled='{b[19:]}'" if type(b) == str and b.startswith('--http.log.enabled=') else b for b in list(rv) ]
+    rv = [ f"--approot='{b[10:]}'" if type(b) == str and b.startswith('--approot=') else b for b in list(rv) ]
+    rv = [ f"--preview='{b[10:]}'" if type(b) == str and b.startswith('--preview=') else b for b in list(rv) ]
+    return rv
+
+  def _run_stackql_exec_command_docker(
+    self,
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query,
+    *args,
+    **cfg
+  ):
+    args = _with_default_preview(args)
+    if type(query) == bytes:
+      query = query.decode("utf-8") 
+    reg_location = registry_cfg.get_source_path_for_docker()
+    supplied_args = []
+    stackql_persist_postgres_as_needed = cfg.pop('stackql_persist_postgres_as_needed', False)
+    if cfg.pop('stackql_rollback_eager', False):
+      supplied_args.append("--session='{\"rollback_type\":\"eager\"}'")
+    if cfg.pop('stackql_H', False):
+      supplied_args.append('--output=text')
+      supplied_args.append('-H')
+    if cfg.pop('stackql_dataflow_permissive', False):
+      supplied_args.append('--dataflow.dependency.max=50')
+      supplied_args.append('--dataflow.components.max=50')
+    if cfg.pop('stackql_debug_http', False):
+      supplied_args.append("--http.log.enabled=true")
+    if cfg.pop('stackql_dryrun', False):
+      supplied_args.append('--dryrun')
+    query_from_input_file_path = cfg.pop('stackql_i', False)
+    if query_from_input_file_path:
+      supplied_args.append(f'--infile={query_from_input_file_path}')
+    approot = cfg.pop('stackql_approot', False)
+    if approot:
+      supplied_args.append(f'--approot={approot}')
+    query_from_input_file_data_path = cfg.pop('stackql_iqldata', False)
+    if query_from_input_file_data_path:
+      supplied_args.append(f'--iqldata={query_from_input_file_data_path}')
+    query_var_list = cfg.pop('stackql_vars', False)
+    if query_var_list:
+      for q_var in query_var_list:
+        supplied_args.append(f'--var={q_var}')
+    supplied_args += self._docker_transform_args(*self._output_format_args(cfg))
+    registry_cfg_str = registry_cfg.get_config_str('docker')
+    if registry_cfg_str != "":
+      supplied_args.append(f"--registry='{registry_cfg_str}'")
+    if auth_cfg_str != "":
+      supplied_args.append(f"--auth='{auth_cfg_str}'")
+    if sql_backend_cfg_str != "":
+      supplied_args.append(f"--sqlBackend='{sql_backend_cfg_str}'")
+    supplied_args.append("--tls.allowInsecure=true")
+    supplied_args.append(f"--execution.concurrency.limit={self._concurrency_limit}")
+    transformed_args = self._docker_transform_args(*args)
+    supplied_args = supplied_args + transformed_args
+    query_escaped = query.replace("'", "'\"'\"'")
+    os.environ['REGISTRY_SRC']= f'./{reg_location}'
+    if self._sql_backend == SQL_BACKEND_POSTGRES_TCP:
+      os.environ['DB_SETUP_SRC']= f'./test/db/postgres'
+    sleep_prefix = '' if self._sql_backend == SQL_BACKEND_CANONICAL_SQLITE_EMBEDDED else 'sleep 2 && '
+    env_args_to_docker = self._expand_docker_env_args(okta_secret_str, github_secret_str, k8s_secret_str)
+    invocation_str = f"{sleep_prefix}stackql exec {' '.join(supplied_args)} '{query_escaped}'"
+    if query_from_input_file_path:
+      invocation_str = f"{sleep_prefix}stackql exec {' '.join(supplied_args)}"
+    docker_args = (
+      "docker",
+      "compose",
+      "-p",
+      "execrun",
+      "run",
+      "--rm",
+      *env_args_to_docker,
+      "stackqlsrv",
+      "bash",
+      "-c",
+      invocation_str,
+    )
+    if cfg.pop('start_only', False):
+      # Non-blocking, so the caller can watch stdout grow. Robot's Process
+      # library is used from the main thread; no threads are involved.
+      return super().start_process(*docker_args, **cfg)
+    res = super().run_process(
+      *docker_args,
+      **cfg
+    )
+    self.log(res.stdout)
+    self.log(res.stderr)
+    return res
+
+
+  def _get_allowed_docker_env_keys(self):
+    return [ 
+        'AWS_ACCESS_KEY_ID',
+        'AWS_SECRET_ACCESS_KEY',
+        'AZURE_CLIENT_ID',
+        'AZURE_CLIENT_SECRET',
+        'AZURE_INTEGRATION_TESTING_SUB_ID',
+        'AZURE_TENANT_ID',
+        'GOOGLE_APPLICATION_CREDENTIALS'
+    ]
+
+
+  def _output_format_args(self, cfg :dict) -> list:
+    rv = []
+    output_format = cfg.pop('stackql_output', False)
+    if output_format:
+      rv.append(f'--output={output_format}')
+    delimiter = cfg.pop('stackql_delimiter', False)
+    if delimiter:
+      rv.append(f'--delimiter={delimiter}')
+    outfile = cfg.pop('stackql_outfile', False)
+    if outfile:
+      rv.append(f'--outfile={outfile}')
+    return rv
+
+  def _get_default_env(self) -> dict:
+    existing = dict(os.environ)
+    rv = {}
+    for k, v in existing.items():
+      if k in self._get_allowed_docker_env_keys():
+        rv[k] = v
+    rv["AZ_ACCESS_TOKEN"] = os.environ.get('AZ_ACCESS_TOKEN', "az_access_dummy_secret")
+    rv["SUMO_CREDS"] = os.environ.get('SUMO_CREDS', "sumologicdummysecret")
+    rv["DIGITALOCEAN_TOKEN"] = os.environ.get('DIGITALOCEAN_TOKEN', "digitaloceandummysecret")
+    rv["DUMMY_DIGITALOCEAN_USERNAME"] = os.environ.get('DUMMY_DIGITALOCEAN_USERNAME', "myusername")
+    rv["DUMMY_DIGITALOCEAN_PASSWORD"] = os.environ.get('DUMMY_DIGITALOCEAN_PASSWORD', "mypassword")
+    if os.environ.get('YOUR_OAUTH2_CLIENT_ID_ENV_VAR') is not None:
+      rv["YOUR_OAUTH2_CLIENT_ID_ENV_VAR"] = os.environ.get('YOUR_OAUTH2_CLIENT_ID_ENV_VAR')
+    if os.environ.get('YOUR_OAUTH2_CLIENT_SECRET_ENV_VAR') is not None:
+      rv["YOUR_OAUTH2_CLIENT_SECRET_ENV_VAR"] = os.environ.get('YOUR_OAUTH2_CLIENT_SECRET_ENV_VAR')
+    if os.environ.get('YOUR_OAUTH2_SOME_SYSTEM_ACCOUNT_ID') is not None:
+      rv["YOUR_OAUTH2_SOME_SYSTEM_ACCOUNT_ID"] = os.environ.get('YOUR_OAUTH2_SOME_SYSTEM_ACCOUNT_ID')
+    for k in (
+        'STACKQL_OCI_TESTING_TENANCY_OCID',
+        'STACKQL_OCI_TESTING_USER_OCID',
+        'STACKQL_OCI_TESTING_FINGERPRINT',
+        'STACKQL_OCI_TESTING_PRIVATE_KEY_PATH',
+        'STACKQL_NATIVE_TEST_DEPLOYMENT',
+    ):
+      if os.environ.get(k) is not None:
+        rv[k] = os.environ.get(k)
+    return rv
+
+
+  def _run_stackql_shell_command_docker(
+    self,
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    queries :typing.Iterable[str],
+    *args,
+    **cfg
+  ):
+    args = _with_default_preview(args)
+    reg_location = registry_cfg.get_source_path_for_docker()
+    supplied_args = []
+    if cfg.pop('stackql_rollback_eager', False):
+      supplied_args.append("--session={\"rollback_type\":\"eager\"}")
+    if cfg.pop('stackql_H', False):
+      supplied_args.append('--output=text')
+      supplied_args.append('-H')
+    if cfg.pop('stackql_dataflow_permissive', False):
+      supplied_args.append('--dataflow.dependency.max=50')
+      supplied_args.append('--dataflow.components.max=50')
+    if cfg.pop('stackql_debug_http', False):
+      supplied_args.append("--http.log.enabled=true")
+    registry_cfg_str = registry_cfg.get_config_str('docker')
+    if registry_cfg_str != "":
+      supplied_args.append(f"--registry='{registry_cfg_str}'")
+    if auth_cfg_str != "":
+      supplied_args.append(f"--auth='{auth_cfg_str}'")
+    approot = cfg.pop('stackql_approot', False)
+    if approot:
+      supplied_args.append(f'--approot={approot}')
+    if sql_backend_cfg_str != "":
+      supplied_args.append(f"--sqlBackend='{sql_backend_cfg_str}'")
+    supplied_args.append("--tls.allowInsecure=true")
+    supplied_args.append(f"--execution.concurrency.limit={self._concurrency_limit}")
+    transformed_args = self._docker_transform_args(*args)
+    supplied_args = supplied_args + transformed_args
+    os.environ['REGISTRY_SRC']= f'./{reg_location}'
+    start_cmd = [
+      "docker", 
+      "compose",
+      "-p",
+      "stackqlshell",
+      "run",
+      "--rm",
+      "-e",
+      f"OKTA_SECRET_KEY={okta_secret_str}", 
+      "-e",
+      f"GITHUB_SECRET_KEY={github_secret_str}",
+      "-e",
+      f"K8S_SECRET_KEY={k8s_secret_str}",
+      "-e",
+      f"AZ_ACCESS_TOKEN={self._get_default_env().get('AZ_ACCESS_TOKEN')}",
+      "-e",
+      f"SUMO_CREDS={self._get_default_env().get('SUMO_CREDS')}",
+      "-e",
+      f"DIGITALOCEAN_TOKEN={self._get_default_env().get('DIGITALOCEAN_TOKEN')}",
+      "-e",
+      f"DUMMY_DIGITALOCEAN_USERNAME={self._get_default_env().get('DUMMY_DIGITALOCEAN_USERNAME')}",
+      "-e",
+      f"DUMMY_DIGITALOCEAN_PASSWORD={self._get_default_env().get('DUMMY_DIGITALOCEAN_PASSWORD')}",
+      "stackqlsrv",
+      "bash",
+      "-c",
+      f"stackql {' '.join(supplied_args)} shell",
+    ]
+    stdout = cfg.get('stdout', subprocess.PIPE)
+    stderr = cfg.get('stderr', subprocess.PIPE)
+    shell_session = ShellSession()
+    res = shell_session.run_shell_session(
+      start_cmd,
+      queries,
+      stdout=stdout,
+      stderr=stderr,
+    )
+    self.log(res.stdout)
+    self.log(res.stderr)
+    return res
+
+
+  def _run_stackql_exec_command_native(
+    self,  
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query,
+    *args,
+    **cfg
+  ):
+    args = _with_default_preview(args)
+    self.set_environment_variable("OKTA_SECRET_KEY", okta_secret_str)
+    self.set_environment_variable("GITHUB_SECRET_KEY", github_secret_str)
+    self.set_environment_variable("K8S_SECRET_KEY", k8s_secret_str)
+    self.set_environment_variable("AZ_ACCESS_TOKEN", f"{self._get_default_env().get('AZ_ACCESS_TOKEN')}")
+    self.set_environment_variable("SUMO_CREDS", f"{self._get_default_env().get('SUMO_CREDS')}")
+    self.set_environment_variable("DIGITALOCEAN_TOKEN", f"{self._get_default_env().get('DIGITALOCEAN_TOKEN')}")
+    self.set_environment_variable("DUMMY_DIGITALOCEAN_USERNAME", f"{self._get_default_env().get('DUMMY_DIGITALOCEAN_USERNAME')}")
+    self.set_environment_variable("DUMMY_DIGITALOCEAN_PASSWORD", f"{self._get_default_env().get('DUMMY_DIGITALOCEAN_PASSWORD')}")
+    supplied_args = [ stackql_exe, "exec" ]
+    stackql_persist_postgres_as_needed = cfg.pop('stackql_persist_postgres_as_needed', False)
+    if cfg.pop('stackql_rollback_eager', False):
+      supplied_args.append("--session={\"rollback_type\":\"eager\"}")
+    if cfg.pop('stackql_H', False):
+      supplied_args.append('--output=text')
+      supplied_args.append('-H')
+    if cfg.pop('stackql_dataflow_permissive', False):
+      supplied_args.append('--dataflow.dependency.max=50')
+      supplied_args.append('--dataflow.components.max=50')
+    if cfg.pop('stackql_debug_http', False):
+      supplied_args.append("--http.log.enabled=true")
+    if cfg.pop('stackql_dryrun', False):
+      supplied_args.append('--dryrun')
+    query_from_input_file_path = cfg.pop('stackql_i', False)
+    if query_from_input_file_path:
+      supplied_args.append(f'--infile={query_from_input_file_path}')
+    approot = cfg.pop('stackql_approot', False)
+    if approot:
+      supplied_args.append(f'--approot={approot}')
+    query_from_input_file_data_path = cfg.pop('stackql_iqldata', False)
+    if query_from_input_file_data_path:
+      supplied_args.append(f'--iqldata={query_from_input_file_data_path}')
+    query_var_list = cfg.pop('stackql_vars', False)
+    if query_var_list:
+      for q_var in query_var_list:
+        supplied_args.append(f'--var={q_var}')
+    supplied_args += self._output_format_args(cfg)
+    registry_cfg_str = registry_cfg.get_config_str('native')
+    if registry_cfg_str != "":
+      supplied_args.append(f"--registry={registry_cfg_str}")
+    if auth_cfg_str != "":
+      supplied_args.append(f"--auth={auth_cfg_str}")
+    if sql_backend_cfg_str != "":
+      supplied_args.append(f"--sqlBackend={sql_backend_cfg_str}")
+    supplied_args.append("--tls.allowInsecure=true")
+    supplied_args.append(f"--execution.concurrency.limit={self._concurrency_limit}")
+    if not query_from_input_file_path:
+      supplied_args.append(query)
+    if cfg.pop('start_only', False):
+      # Non-blocking, so the caller can watch stdout grow. Robot's Process
+      # library is used from the main thread; no threads are involved.
+      return super().start_process(
+        *supplied_args,
+        *args,
+        **cfg
+      )
+    res = super().run_process(
+      *supplied_args,
+      *args,
+      **cfg
+    )
+    self.log(res.stdout)
+    self.log(res.stderr)
+    return res
+
+
+  def _run_stackql_shell_command_native(
+    self,  
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    queries :typing.Iterable[str],
+    *args,
+    **cfg
+  ):
+    args = _with_default_preview(args)
+    self.set_environment_variable("OKTA_SECRET_KEY", okta_secret_str)
+    self.set_environment_variable("GITHUB_SECRET_KEY", github_secret_str)
+    self.set_environment_variable("K8S_SECRET_KEY", k8s_secret_str)
+    self.set_environment_variable("AZ_ACCESS_TOKEN", f"{self._get_default_env().get('AZ_ACCESS_TOKEN')}")
+    self.set_environment_variable("SUMO_CREDS", f"{self._get_default_env().get('SUMO_CREDS')}")
+    self.set_environment_variable("DIGITALOCEAN_TOKEN", f"{self._get_default_env().get('DIGITALOCEAN_TOKEN')}")
+    self.set_environment_variable("DUMMY_DIGITALOCEAN_USERNAME", f"{self._get_default_env().get('DUMMY_DIGITALOCEAN_USERNAME')}")
+    self.set_environment_variable("DUMMY_DIGITALOCEAN_PASSWORD", f"{self._get_default_env().get('DUMMY_DIGITALOCEAN_PASSWORD')}")
+    supplied_args = [ stackql_exe, "shell" ]
+    if cfg.pop('stackql_rollback_eager', False):
+      supplied_args.append("--session={\"rollback_type\":\"eager\"}")
+    if cfg.pop('stackql_H', False):
+      supplied_args.append('--output=text')
+      supplied_args.append('-H')
+    if cfg.pop('stackql_dataflow_permissive', False):
+      supplied_args.append('--dataflow.dependency.max=50')
+      supplied_args.append('--dataflow.components.max=50')
+    if cfg.pop('stackql_debug_http', False):
+      supplied_args.append("--http.log.enabled=true")
+    registry_cfg_str = registry_cfg.get_config_str('native')
+    if registry_cfg_str != "":
+      supplied_args.append(f"--registry={registry_cfg_str}")
+    if auth_cfg_str != "":
+      supplied_args.append(f"--auth={auth_cfg_str}")
+    if sql_backend_cfg_str != "":
+      supplied_args.append(f"--sqlBackend={sql_backend_cfg_str}")
+    supplied_args.append("--tls.allowInsecure=true")
+    approot = cfg.pop('stackql_approot', False)
+    if approot:
+      supplied_args.append(f'--approot={approot}')
+    else:
+      supplied_args.append(f'--approot={_TEST_APP_CACHE_ROOT}')
+    supplied_args.append(f"--execution.concurrency.limit={self._concurrency_limit}")
+    supplied_args = supplied_args + list(args)
+    stdout = cfg.get('stdout', subprocess.PIPE)
+    stderr = cfg.get('stderr', subprocess.PIPE)
+    shell_session = ShellSession()
+    res = shell_session.run_shell_session(
+      supplied_args,
+      queries,
+      stdout=stdout,
+      stderr=stderr,
+    )
+    self.log(res.stdout)
+    self.log(res.stderr)
+    return res
+
+  @keyword
+  def should_PG_client_error_inline_contain(self, curdir :str, psql_exe :str, psql_conn_str :str, query :str, expected_output :str):
+    result =    self._run_PG_client_command(
+      curdir,
+      psql_exe,
+      psql_conn_str,
+      query
+    ) #    ${CURDIR}    ${PSQL_EXE}    ${_CONN_STR}    ${_QUERY}
+    return self.should_contain(result.stderr, expected_output)
+
+
+  @keyword
+  def should_PG_client_inline_contain(self, curdir :str, psql_exe :str, psql_conn_str :str, query :str, expected_output :str, **cfg):
+    result = self._run_PG_client_command(
+      curdir,
+      psql_exe,
+      psql_conn_str,
+      query,
+      **cfg
+    )
+    return self.should_contain(result.stdout, expected_output)
+
+  
+  @keyword
+  def should_PG_client_stderr_inline_contain(self, curdir :str, psql_exe :str, psql_conn_str :str, query :str, expected_output :str, **cfg):
+    result = self._run_PG_client_command(
+      curdir,
+      psql_exe,
+      psql_conn_str,
+      query,
+      **cfg
+    )
+    return self.should_contain(result.stderr, expected_output)
+
+
+  @keyword
+  def should_PG_client_inline_equal(self, curdir :str, psql_exe :str, psql_conn_str :str, query :str, expected_output :str, **cfg):
+    result =    self._run_PG_client_command(
+      curdir,
+      psql_exe,
+      psql_conn_str,
+      query
+    )
+    return self.should_be_equal(result.stdout, expected_output, collapse_spaces=cfg.pop('collapse_spaces', False))
+  
+
+  @keyword
+  def should_sqlite_inline_equal(self, curdir :str, sqlite_exe :str, sqlite_db_file :str, query :str, expected_output :str, *args, **kwargs):
+    result = None
+    if len(args) == 0:
+      result =    self._run_sqlite_command(
+        curdir,
+        sqlite_exe,
+        sqlite_db_file,
+        query
+      )
+    else:
+      result =    self._run_sqlite_command(
+        curdir,
+        sqlite_exe,
+        *args,
+        sqlite_db_file,
+        query
+      ) 
+    return self.should_be_equal(result.stdout, expected_output, collapse_spaces=kwargs.pop('collapse_spaces', False))
+  
+
+  @keyword
+  def should_PG_client_inline_equal_bench(self, curdir :str, psql_exe :str, psql_conn_str :str, query :str, expected_output :str, max_mean_time :float = 1.7, max_time :float = 10.0, repeat_count = 10, **cfg):
+    times = []
+    for i in range(repeat_count):
+      start_time = time.time()
+      result =    self._run_PG_client_command(
+        curdir,
+        psql_exe,
+        psql_conn_str,
+        query
+      )
+      end_time = time.time()
+      duration = end_time - start_time
+      times.append(duration)
+      self.should_be_equal(result.stdout, expected_output, collapse_spaces=cfg.pop('collapse_spaces', False))
+    mean_time = sum(times) / len(times)
+    self.log(f"mean_time = {mean_time}")
+    self.log(f"max_time = {max(times)}")
+    self.should_be_true(mean_time < max_mean_time)
+    return self.should_be_true(all([ t < max_time for t in times ]))
+
+
+  @keyword
+  def should_PG_client_session_inline_equal(self, conn_str :str, queries :typing.List[str], expected_output :typing.List[typing.Dict], **kwargs):
+    client = PsycoPGClient(conn_str)
+    result =  client.run_queries(
+      queries
+    )
+    self.log(result)
+    return self.lists_should_be_equal(result, expected_output)
+  
+
+  @keyword
+  def should_PG_client_session_inline_equal_strict(self, conn_str :str, queries :typing.List[str], expected_output :typing.List[typing.Dict], **kwargs):
+    client = PsycoPGClient(conn_str)
+    result =  client.run_queries_strict(
+      queries
+    )
+    self.log(result)
+    return self.lists_should_be_equal(result, expected_output)
+
+  
+  @keyword
+  def should_PG_client_session_inline_contain(self, conn_str :str, queries :typing.List[str], expected_output :typing.List[typing.Dict], **kwargs):
+    client = PsycoPGClient(conn_str)
+    result =  client.run_queries(
+      queries
+    )
+    self.log(result)
+    return self.list_should_contain_sub_list(result, expected_output)
+
+
+  @keyword
+  def should_sqlalchemy_raw_session_inline_equal(self, conn_str :str, queries :typing.List[str], expected_output :typing.List, **kwargs):
+    client = SQLAlchemyClient(conn_str)
+    result =  client.run_raw_queries(
+      queries
+    )
+    self.log(result)
+    return self.lists_should_be_equal(result, expected_output)
+
+
+  @keyword
+  def should_sqlalchemy_raw_session_inline_contain(self, conn_str :str, queries :typing.List[str], expected_output :typing.Tuple, **kwargs):
+    client = SQLAlchemyClient(conn_str)
+    result =  client.run_raw_queries(
+      queries
+    )
+    self.log(result)
+    return self.list_should_contain_value(result, expected_output)
+  
+
+  @keyword
+  def should_sqlalchemy_raw_session_inline_have_length(self, conn_str :str, queries :typing.List[str], expected_length :int, **kwargs):
+    client = SQLAlchemyClient(conn_str)
+    result =  client.run_raw_queries(
+      queries
+    )
+    self.log(result)
+    return self.should_be_equal(len(result), expected_length, collapse_spaces=kwargs.pop('collapse_spaces', False))
+  
+
+  @keyword
+  def should_sqlalchemy_raw_session_inline_have_length_greater_than_or_equal_to(self, conn_str :str, queries :typing.List[str], expected_length :int, **kwargs):
+    client = SQLAlchemyClient(conn_str)
+    result =  client.run_raw_queries(
+      queries
+    )
+    self.log(result)
+    return self.should_be_true(len(result) >= expected_length)
+
+
+  @keyword
+  def should_PG_client_column_descriptions_equal(self, conn_str :str, query :str, expected_descriptions :typing.List[typing.Dict], **kwargs):
+    """Execute a query via psycopg2 and verify column descriptions (name + type_code OID)."""
+    client = PsycoPG2Client(conn_str)
+    result = client.get_column_descriptions(query)
+    self.log(f"Column descriptions: {result}")
+    return self.lists_should_be_equal(result, expected_descriptions)
+
+
+  @keyword
+  def should_PG_client_prepared_query_results_contain(self, conn_str :str, query :str, params :typing.Tuple, expected_value :str, **kwargs):
+    """Execute a parameterised query via psycopg2 (extended query protocol) and verify results contain a value."""
+    client = PsycoPG2Client(conn_str)
+    result = client.exec_prepared_query(query, params)
+    self.log(f"Prepared query results: {result}")
+    result_str = str(result)
+    if expected_value not in result_str:
+      raise AssertionError(f"Expected '{expected_value}' in results but got: {result_str}")
+
+
+  @keyword
+  def should_PG_client_prepared_query_results_have_length(self, conn_str :str, query :str, params :typing.Tuple, expected_length :int, **kwargs):
+    """Execute a parameterised query via psycopg2 (extended query protocol) and verify result count."""
+    client = PsycoPG2Client(conn_str)
+    result = client.exec_prepared_query(query, params)
+    self.log(f"Prepared query results ({len(result)} rows): {result}")
+    return self.should_be_equal(len(result), expected_length)
+
+
+  @keyword
+  def should_PG_client_bound_query_results_equal(self, conn_str :str, query :str, params :typing.Tuple, expected_output :typing.List[typing.Dict], **kwargs):
+    """Execute a parameterised query via psycopg (v3, extended query protocol with server side binding) and verify the rows."""
+    client = PsycoPGClient(conn_str)
+    result = client.exec_bound_query(query, params)
+    self.log(result)
+    return self.lists_should_be_equal(result, expected_output)
+
+
+  @keyword
+  def should_PG_client_V2_session_inline_equal(self, conn_str :str, queries :typing.List[str], expected_output :typing.List[typing.Dict], **kwargs):
+    client = PsycoPG2Client(conn_str)
+    result =  client.run_queries(
+      queries
+    )
+    self.log(result)
+    return self.lists_should_be_equal(result, expected_output)
+
+
+  @keyword
+  def should_stackql_exec_inline_equal_page_limited(
+    self, 
+    stackql_exe :str, 
+    page_limit :int,
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_output :str,
+    *args,
+    **cfg
+  ):
+    args = ( f"--http.response.pageLimit={page_limit}", ) + args
+    result = self._run_stackql_exec_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str, 
+      query,
+      *args,
+      **cfg
+    )
+    return self.should_be_equal(result.stdout, expected_output, collapse_spaces=cfg.pop('collapse_spaces', False))
+
+
+  @keyword
+  def run_stackql_exec_command_no_errors(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    query :str,
+    *args,
+    **cfg
+  ):
+    result = self._run_stackql_exec_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      query,
+      *args,
+      **cfg
+    )
+    self.should_be_equal_as_integers(result.rc, 0)
+    return result
+
+
+  @keyword
+  def should_stackql_exec_inline_equal(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_output :str,
+    *args,
+    **cfg
+  ):
+    repeat_count = int(cfg.pop('repeat_count', 1))
+    for _ in range(repeat_count):
+      result = self._run_stackql_exec_command(
+        stackql_exe, 
+        okta_secret_str,
+        github_secret_str,
+        k8s_secret_str,
+        registry_cfg, 
+        auth_cfg_str, 
+        sql_backend_cfg_str,
+        query,
+        *args,
+        **cfg
+      )
+      self.should_be_equal(result.stdout, expected_output, collapse_spaces=cfg.pop('collapse_spaces', False))
+  
+
+  @keyword
+  def python_executable(self) -> str:
+    return sys.executable
+
+  @keyword
+  def get_free_port(self) -> int:
+    """Reserve an ephemeral port from the OS. A fixed port is the usual cause of
+    a mock that starts on one CI run and not the next."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+      sock.bind(('127.0.0.1', 0))
+      return sock.getsockname()[1]
+
+  @keyword
+  def wait_for_server(self, url :str, timeout :float = 60, stdout :str = None, stderr :str = None):
+    import urllib.request
+    deadline = time.time() + float(timeout)
+    last = None
+    while time.time() < deadline:
+      try:
+        urllib.request.urlopen(url, timeout=2)
+        return
+      except Exception as exc:
+        last = exc
+        time.sleep(0.2)
+    raise AssertionError(
+      f'server not up at {url}: {last}\n'
+      f'--- stdout ---\n{self._read_if_present(stdout)}\n'
+      f'--- stderr ---\n{self._read_if_present(stderr)}'
+    )
+
+  def _read_if_present(self, path :str) -> str:
+    if not path or not os.path.exists(path):
+      return f'(no file at {path})'
+    with open(path) as fh:
+      return fh.read()[-4000:]
+
+  @keyword
+  def write_gcp_service_account(self, path :str):
+    """Throwaway RSA service-account key so the OAuth exchange can sign a JWT; the
+    mock ignores the signature. Generated per run, never a real credential."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+      serialization.Encoding.PEM,
+      serialization.PrivateFormat.PKCS8,
+      serialization.NoEncryption(),
+    ).decode()
+    with open(path, 'w') as fh:
+      json.dump({
+        'type': 'service_account',
+        'project_id': 'mock-project',
+        'client_email': 'mock@mock-project.iam.gserviceaccount.com',
+        'private_key': pem,
+        'token_uri': 'https://oauth2.googleapis.com/token',
+      }, fh)
+
+  @keyword
+  def should_stackql_exec_stream_incrementally(
+    self,
+    stackql_exe :str,
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg,
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_row_count :int,
+    min_spread_seconds :float = 0.2,
+    *args,
+    **cfg
+  ):
+    """
+    Assert rows reach the output stream while the query is still running.
+
+    The query is started without blocking and its stdout file is sampled from
+    this thread while the process is alive. A run that buffers its rows writes
+    the file once at the end, so the samples show a single jump; a run that
+    streams shows it growing at several distinct times.
+    """
+    stdout_path = cfg.get('stdout')
+    if not stdout_path:
+      raise Exception('should_stackql_exec_stream_incrementally requires stdout=<path>')
+    if os.path.exists(stdout_path):
+      os.remove(stdout_path)
+    timeout = float(cfg.pop('stream_timeout_seconds', 120))
+    handle = self._run_stackql_exec_command(
+      stackql_exe, okta_secret_str, github_secret_str, k8s_secret_str,
+      registry_cfg, auth_cfg_str, sql_backend_cfg_str, query, *args,
+      start_only=True, **cfg
+    )
+    samples = []
+    deadline = time.time() + timeout
+    while self.is_process_running(handle):
+      if time.time() > deadline:
+        self.terminate_process(handle)
+        raise Exception('query did not complete within the streaming timeout')
+      size = os.path.getsize(stdout_path) if os.path.exists(stdout_path) else 0
+      if not samples or size != samples[-1][1]:
+        samples.append((time.time(), size))
+      time.sleep(0.02)
+    self.wait_for_process(handle, timeout=timeout)
+
+    growth = [s for s in samples if s[1] > 0]
+    with open(stdout_path) as fh:
+      rows = [line for line in fh.read().splitlines() if line.strip()]
+    if len(rows) != int(expected_row_count):
+      raise Exception(f'expected {expected_row_count} rows, got {len(rows)}')
+    if len(growth) < 2:
+      raise Exception(
+        f'output appeared in a single write, so rows were buffered rather than streamed; '
+        f'samples={samples}'
+      )
+    spread = growth[-1][0] - growth[0][0]
+    if spread < float(min_spread_seconds):
+      raise Exception(
+        f'output arrived over {spread:.3f}s, under the {min_spread_seconds}s expected for a '
+        f'streamed result; rows are probably being buffered'
+      )
+
+  @keyword
+  def should_stackql_exec_inline_jsonl_set_equal(
+    self,
+    stackql_exe :str,
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg,
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_jsonl :str,
+    *args,
+    **cfg
+  ):
+    """
+    Compare JSONL output against an expected set, ignoring row order.
+
+    Relations whose rows are streamed cannot honour ORDER BY, because the rows
+    never reach the SQL backend. Their contents are still deterministic, so the
+    emitted objects are compared as an unordered multiset.
+    """
+    repeat_count = int(cfg.pop('repeat_count', 1))
+    for _ in range(repeat_count):
+      result = self._run_stackql_exec_command(
+        stackql_exe,
+        okta_secret_str,
+        github_secret_str,
+        k8s_secret_str,
+        registry_cfg,
+        auth_cfg_str,
+        sql_backend_cfg_str,
+        query,
+        '-o=jsonl',
+        *args,
+        **cfg
+      )
+      # Under docker the compose status logs land on stderr (see
+      # _verify_both_streams), so stderr is only a usable failure signal natively.
+      if self._execution_platform != 'docker':
+        if result.stderr is not None and result.stderr.strip() != '':
+          raise Exception(f'query emitted stderr, so the row set is not trustworthy: {result.stderr.strip()}')
+      self._verify_jsonl_set(result.stdout, expected_jsonl, result.stderr)
+
+  def _verify_jsonl_set(self, actual_stdout :str, expected_jsonl :str, actual_stderr :str = None):
+    actual = self._parse_jsonl(actual_stdout, 'actual')
+    expected = self._parse_jsonl(expected_jsonl, 'expected')
+    if actual == expected:
+      return
+    missing = [r for r in expected if expected.count(r) > actual.count(r)]
+    unexpected = [r for r in actual if actual.count(r) > expected.count(r)]
+    raise Exception(
+      f'JSONL row sets differ.\nMissing ({len(missing)}): {missing[:5]}\n'
+      f'Unexpected ({len(unexpected)}): {unexpected[:5]}\n'
+      f'stderr: {(actual_stderr or "").strip()[-2000:]}'
+    )
+
+  def _parse_jsonl(self, payload :str, label :str) -> list:
+    rows = []
+    for line_number, line in enumerate(payload.splitlines(), start=1):
+      stripped = line.strip()
+      if not stripped:
+        continue
+      try:
+        parsed = json.loads(stripped)
+      except json.JSONDecodeError as exc:
+        raise Exception(f'{label} line {line_number} is not JSON: {stripped!r}') from exc
+      rows.append(json.dumps(parsed, sort_keys=True))
+    return sorted(rows)
+
+  @keyword
+  def should_stackql_exec_otel_snapshot(
+    self,
+    stackql_exe :str,
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg,
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query :str,
+    expected :str,
+    *args,
+    **cfg
+  ) -> typing.List[str]:
+    """
+    Run with `--output otel` and check the snapshot invariants (issue #738):
+    one LogsData per row plus one completion record, every record sharing the
+    snapshot instant, snapshot id and span. `expected` is a JSON object with
+    the known attribute values: `context` is verified on every record, `rows`
+    (in order) on the row records and `completion` on the completion record;
+    dynamic values (ids, timestamps, fingerprints) are simply left unlisted.
+    Returns the row fingerprints so a repeat run can be compared.
+    """
+    expectation = json.loads(expected)
+    result = self._run_stackql_exec_command(
+      stackql_exe, okta_secret_str, github_secret_str, k8s_secret_str,
+      registry_cfg, auth_cfg_str, sql_backend_cfg_str, query, '-o=otel', *args, **cfg
+    )
+    records = []
+    for line in result.stdout.splitlines():
+      if not line.strip():
+        continue
+      scope_logs = json.loads(line)['resourceLogs'][0]['scopeLogs'][0]
+      if scope_logs['scope']['name'] != 'github.com/stackql/stackql/internal/stackql/output':
+        raise Exception(f'unexpected scope: {scope_logs["scope"]}')
+      for rec in scope_logs['logRecords']:
+        rec['attrs'] = {a['key']: self._otel_value(a['value']) for a in rec['attributes']}
+        records.append(rec)
+    rows = [r for r in records if 'stackql.row.index' in r['attrs']]
+    completions = [r for r in records if r['attrs'].get('stackql.snapshot.complete') is True]
+    expected_rows = expectation.get('rows', [])
+    if len(rows) != len(expected_rows) or len(completions) != 1 or len(records) != len(rows) + 1:
+      raise Exception(
+        f'expected {len(expected_rows)} row records and one completion record, '
+        f'got {len(rows)} rows and {len(completions)} completions in {len(records)} records; '
+        f'stderr: {(result.stderr or "").strip()[-2000:]}'
+      )
+    for i, (rec, want) in enumerate(zip(rows + completions, expected_rows + [expectation.get('completion', {})])):
+      label = f'row {i}' if i < len(rows) else 'completion'
+      for key, value in {**expectation.get('context', {}), **want}.items():
+        if key not in rec['attrs']:
+          raise Exception(f'{label}: attribute {key!r} missing; have {sorted(rec["attrs"])}')
+        if rec['attrs'][key] != value:
+          raise Exception(f'{label}: attribute {key!r} = {rec["attrs"][key]!r}, want {value!r}')
+    for key in ('timeUnixNano', 'spanId', 'traceId'):
+      if len({r[key] for r in records}) != 1:
+        raise Exception(f'{key} differs across the records of one statement')
+    if len({r['attrs']['stackql.snapshot.id'] for r in records}) != 1:
+      raise Exception('stackql.snapshot.id differs across the records of one statement')
+    if [r['attrs']['stackql.row.index'] for r in rows] != list(range(len(rows))):
+      raise Exception(f'row indices are not sequential: {[r["attrs"]["stackql.row.index"] for r in rows]}')
+    if completions[0]['attrs']['stackql.rows_returned'] != len(rows):
+      raise Exception(f'completion rows_returned {completions[0]["attrs"]["stackql.rows_returned"]} != {len(rows)}')
+    fingerprints = [r['attrs']['stackql.row.fingerprint'] for r in rows]
+    if any(not fp.startswith('sha256:') or len(fp) != 71 for fp in fingerprints):
+      raise Exception(f'malformed fingerprints: {fingerprints}')
+    return fingerprints
+
+  @staticmethod
+  def _otel_value(any_value :dict):
+    """Decode an OTLP/JSON AnyValue to the natural python type."""
+    kind, raw = next(iter(any_value.items()))
+    if kind == 'intValue':
+      return int(raw)
+    return raw
+
+  @keyword
+  def should_stackql_exec_inline_equal_both_streams(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_output :str,
+    expected_stderr_output :str,
+    *args,
+    **cfg
+  ):
+    comparison = {'unordered_http_diagnostics': cfg.pop('unordered_http_diagnostics', False)}
+    repeat_count = int(cfg.pop('repeat_count', 1))
+    for _ in range(repeat_count):
+      result = self._run_stackql_exec_command(
+        stackql_exe, 
+        okta_secret_str,
+        github_secret_str,
+        k8s_secret_str,
+        registry_cfg, 
+        auth_cfg_str, 
+        sql_backend_cfg_str,
+        query,
+        *args,
+        **cfg
+      )
+      return self._verify_both_streams(result, expected_output, expected_stderr_output, **comparison, **cfg)
+
+
+  @keyword
+  def should_stackql_shell_inline_equal(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    queries :typing.Iterable[str],
+    expected_output :str,
+    *args,
+    **cfg
+  ):
+    result = self._run_stackql_shell_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      queries,
+      *args,
+      **cfg
+    )
+    return self.should_be_equal(result.stdout, expected_output, collapse_spaces=cfg.pop('collapse_spaces', False))
+
+  
+  @keyword
+  def should_stackql_shell_inline_contain(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    queries :typing.Iterable[str],
+    expected_output :str,
+    *args,
+    **cfg
+  ):
+    result = self._run_stackql_shell_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      queries,
+      *args,
+      **cfg
+    )
+    return self.should_contain(result.stdout, expected_output)
+
+
+  @keyword
+  def should_stackql_exec_inline_contain(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_output :str,
+    *args,
+    **cfg
+  ):
+    result = self._run_stackql_exec_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      query,
+      *args,
+      **cfg
+    )
+    return self.should_contain(result.stdout, expected_output)
+  
+  @keyword
+  def should_stackql_exec_inline_outfile_contain(
+    self,
+    stackql_exe :str,
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg,
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query :str,
+    outfile :str,
+    expected_output :str,
+    *args,
+    **cfg
+  ):
+    # under docker the outfile is a container path; host_outfile is where the mount lands it
+    host_outfile = cfg.pop('host_outfile', outfile)
+    cfg['stackql_outfile'] = outfile
+    self._run_stackql_exec_command(
+      stackql_exe,
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg,
+      auth_cfg_str,
+      sql_backend_cfg_str,
+      query,
+      *args,
+      **cfg
+    )
+    with open(host_outfile, 'rt', encoding='utf-8') as f:
+      contents = f.read()
+    return self.should_contain(contents, expected_output)
+
+  @keyword
+  def should_stackql_exec_inline_contain_both_streams(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_output :str,
+    expected_output_stderr :str,
+    *args,
+    **cfg
+  ):
+    result = self._run_stackql_exec_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      query,
+      *args,
+      **cfg
+    )
+    return self._contain_both_streams(result, expected_output, expected_output_stderr)
+
+
+  @keyword
+  def should_stackql_exec_inline_equal_stderr(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_output :str,
+    *args,
+    **cfg
+  ):
+    result = self._run_stackql_exec_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      query,
+      *args,
+      **cfg
+    )
+    se = self.application_stderr(result.stderr)
+    return self.should_be_equal(se, expected_output, collapse_spaces=True, formatter='ascii', strip_spaces=True)
+
+  
+  @keyword
+  def should_stackql_exec_inline_contain_stderr(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str, 
+    sql_backend_cfg_str :str,
+    query :str,
+    expected_output :str,
+    *args,
+    **cfg
+  ):
+    result = self._run_stackql_exec_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      query,
+      *args,
+      **cfg
+    )
+    se = self.application_stderr(result.stderr)
+    return self.should_contain(se, expected_output, collapse_spaces=True, strip_spaces=True)
+
+
+  @keyword
+  def should_horrid_query_stackql_inline_equal(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query,
+    expected_output :str,
+    stdout_tmp_file :str,
+  ):
+    result = self._run_stackql_exec_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      query,
+      **{"stdout": stdout_tmp_file }
+    )
+    return self.should_be_equal(result.stdout, expected_output)
+
+
+  @keyword
+  def should_horrid_http_log_enabled_query_stackql_inline_equal(
+    self, 
+    stackql_exe :str, 
+    okta_secret_str :str,
+    github_secret_str :str,
+    k8s_secret_str :str,
+    registry_cfg :RegistryCfg, 
+    auth_cfg_str :str,
+    sql_backend_cfg_str :str,
+    query,
+    expected_output :str,
+    stdout_tmp_file :str,
+    **cfg,
+  ):
+    args = ("--http.log.enabled",)
+    result = self._run_stackql_exec_command(
+      stackql_exe, 
+      okta_secret_str,
+      github_secret_str,
+      k8s_secret_str,
+      registry_cfg, 
+      auth_cfg_str, 
+      sql_backend_cfg_str,
+      query,
+      *args,
+      **{"stdout": stdout_tmp_file }
+    )
+    return self.should_be_equal(
+      result.stdout, 
+      expected_output, 
+      collapse_spaces=cfg.pop('collapse_spaces', False),
+      strip_spaces=cfg.pop('strip_spaces', False),
+    )

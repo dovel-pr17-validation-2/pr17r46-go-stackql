@@ -1,0 +1,475 @@
+
+## Running the MCP server
+
+If necessary, rebuild stackql with:
+
+```bash
+python cicd/python/build.py --build
+```
+
+**Note**: before starting an MCP server, remember to export all appropriate auth env vars.
+
+`--mcp.config` accepts an inline JSON object for both `mcp` and `srv --mcp.server.type=...`.
+File paths and YAML are not supported. Malformed JSON, unknown fields, wrong types and invalid settings
+fail startup before listeners open. Empty tool allowlists retain their existing meaning: all tools are enabled.
+
+We have a nice debug config for running an MCP server with `vscode`, please see [the `vscode` debug launch config](/.vscode/launch.json) for that.  Otherwise, you can run with stackql (assuming locally built into `./build/stackql`):
+
+
+```bash
+
+./build/stackql mcp --mcp.server.type=http --mcp.config '{"server": {"transport": "http", "address": "127.0.0.1:9992", "allow_unauthenticated": true} }'
+
+```
+
+The default mode is `safe`: SELECTs proceed, mutations and lifecycle operations require user approval via the [MCP elicitation flow](#server-modes).  An audit log is written to `./stackql_mcp_server_<RFC3339-utc-second>.log` by default (see [Audit Log](#audit-log)).
+
+### Mode examples
+
+Read-only (mutations and lifecycle refused immediately):
+
+```bash
+
+./build/stackql mcp --mcp.server.type=http --mcp.config '{"server": {"transport": "http", "address": "127.0.0.1:9992", "allow_unauthenticated": true, "mode": "read_only"} }'
+
+```
+
+Delete-safe (INSERTs/UPDATEs proceed; DELETEs and EXECs need approval):
+
+```bash
+
+./build/stackql mcp --mcp.server.type=http --mcp.config '{"server": {"transport": "http", "address": "127.0.0.1:9992", "allow_unauthenticated": true, "mode": "delete_safe"} }'
+
+```
+
+Full access (everything proceeds without approval - use only when the client and operator are trusted):
+
+```bash
+
+./build/stackql mcp --mcp.server.type=http --mcp.config '{"server": {"transport": "http", "address": "127.0.0.1:9992", "allow_unauthenticated": true, "mode": "full_access"} }'
+
+```
+
+The legacy `"read_only": true` JSON key is still accepted and is treated as equivalent to `"mode": "read_only"`.  When both are set, `mode` wins.
+
+### Disabling audit
+
+Audit is on by default.  To opt out:
+
+```bash
+
+./build/stackql mcp --mcp.server.type=http --mcp.config '{"server": {"transport": "http", "address": "127.0.0.1:9992", "allow_unauthenticated": true, "audit": {"disabled": true}} }'
+
+```
+
+### Credential (re)sourcing (`--env.file` + `reload_credentials`)
+
+`--env.file` is a root flag: it nominates a dotenv-style file that every stackql entrypoint (`exec`, `shell`, `srv`, `mcp`) sources into the process environment at startup.  For the MCP server it additionally acts as a mutable credential store: a process env block is fixed at spawn, so a stdio server launched without credential vars (eg by Claude Desktop) can only pick them up from such a file, re-sourced on each `reload_credentials` tool call.
+
+```bash
+
+./build/stackql mcp --mcp.server.type=stdio --env.file /path/to/stackql-credentials.env
+
+```
+
+Semantics:
+
+- Sourced at startup (if the file exists) and again on every `reload_credentials` call; only keys with non-empty values are set, nothing is ever unset.
+- An absent file is created at startup as an empty commented dotenv file (`0600` on unix, parent directories included), so packaged installs (eg MCPB bundles in Claude Desktop) can pass the flag unconditionally; an existing file is never touched, so bundle updates cannot wipe populated credentials.
+- The file may be created, updated or rotated at any time while the server runs.
+- `reload_credentials` runs three ordered phases: re-source the file, invalidate auth contexts registered lazily from provider documents (contexts supplied via `--auth` are retained), then report every installed provider against the now-current environment.  The report is identical before and after a provider's first query; the optional `provider` argument filters it, and an unknown provider name is the only scoped error.
+- Each report row carries variable names, per-provider status (`ok`, `unresolved`, `not_checked`) and `changed` (whether the resolved credential material differs from before the reload); secret values are never returned, logged or audited.  A second reload against an unchanged file is idempotent (`changed: false` throughout).  Without `--env.file` it degrades to a pure status probe; a configured file that has gone missing is an explicit error naming the path.
+- Credentials resolve automatically at query time, so no reload is ever required before querying.  Credential resolution failures on the query tools name the provider and the recovery sequence (fix the env file, call `reload_credentials`, retry); `changed: false` after a failure means the file was not updated.
+- Reload semantics are per process.  In a replicated stateless HTTP deployment an in-band reload mutates one replica only; rotation there belongs at the deployment layer (redeploy, shared secret store, file watcher).
+
+File format: one `KEY=VALUE` per line; `#` comments, blank lines, `export ` prefixes, surrounding quotes and CRLF are tolerated.
+
+Note for Claude Desktop on Windows: `setx` writes the registry, not running processes, and Claude Desktop passes its own (stale) environment to MCP subprocesses; `--env.file` avoids restarts entirely.
+
+
+## Using the MCP Client
+
+This is very much a development tool, not currently recommended for production.  That said, it emulates agent actions and allows us to run regression tests.
+
+Build:
+
+```bash
+python cicd/python/build.py --build-mcp-client
+```
+
+Then, assuming you have a `stackql` MCP server serving streamable HTTP on port `9992`, you can access any endpoint.  The below examples are illustrative of a canonical agent pattern.
+
+
+```bash
+
+## Server identity and runtime metadata.  Call once at session start.
+./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action server_info
+
+## List available providers.
+./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action list_providers
+
+## List available services.
+## **must** supply <provider>
+./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action list_services --exec.args '{"provider": "google"}'
+
+## List available resources.
+## **must** supply <provider>, <service>
+./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action list_resources --exec.args '{"provider": "google", "service": "compute"}'
+
+## List access methods.  Call before writing any query.
+## **must** supply <provider>, <service>, <resource>
+./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action list_methods --exec.args '{"provider": "google", "service": "compute", "resource": "networks"}'
+
+## Describe a single method's I/O contract (always EXTENDED): inputs with param_type and the output fields.
+## **must** supply <provider>, <service>, <resource>, <method>
+./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action describe_method --exec.args '{"provider": "google", "service": "compute", "resource": "networks", "method": "get"}'
+
+## Validate a SELECT (parse + plan) without executing.  SELECT only.
+./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action validate_select_query --exec.args '{"sql": "select name from google.compute.networks where project = '"'"'stackql-demo'"'"';"}'
+
+## Run a SELECT.
+./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action run_select_query --exec.args '{"sql": "select name from google.compute.networks where project = '"'"'stackql-demo'"'"';"}'
+
+## Mutation (INSERT/UPDATE/REPLACE/DELETE).  Tread carefully -- real side effects.
+## Gated by the server mode.  Under the default `safe` mode this call returns
+## an error because the bundled client does not advertise elicitation (it
+## cannot respond to the server's approval prompt).  Start the server with
+## `mode: full_access` to run it without an approval prompt.
+# ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action run_mutation_query --exec.args '{"sql": "delete from google.compute.networks where project = '"'"'stackql-demo'"'"' and network = '"'"'returning-test-03'"'"' ;"}'
+
+## Lifecycle EXEC operation.  Same gating rules as run_mutation_query.
+# ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action run_lifecycle_operation --exec.args '{"sql": "EXEC google.compute.instances.start @project = '"'"'mutable-project'"'"', @zone = '"'"'us-central1-a'"'"', @instance = '"'"'demo'"'"';"}'
+
+```
+
+
+## Canonical agent tools
+
+The server publishes 15 tools.  Each returns both rendered text (for the LLM) and a typed structured payload (for programmatic clients).  Rendering is fixed per tool: a markdown table for uniform multi-row results, a markdown KV block for sparse / single-record / mixed-shape results.
+
+Tools also carry a `title` and every MCP behavioural hint as an explicit boolean (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), derived from the same policy-gate classification that enforces the server [mode](#server-modes): statically read-only tools claim `readOnlyHint`, mutation/lifecycle tools claim `destructiveHint`, and SQL-carrying tools make no read-only claim because their effect depends on the submitted statement. `run_select_query` claims `destructiveHint: false` because it refuses INSERT, UPDATE, DELETE and EXEC in every mode. `openWorldHint` is true for tools that reach provider or registry endpoints (`run_*`, `list_registry`, `pull_provider`) and false for tools that read only local state. Titles and `openWorldHint` are mastered in the frontmatter of `pkg/mcp_server/content/tools/*.md`. Annotations are advisory hints for client UX; enforcement always remains with the policy gate.
+
+| Tool | Renderer | Description |
+|---|---|---|
+| `server_info` | KV | Server identity and runtime: stackql version, backing SQL engine, provider registry location, mode, read-only flag.  Call once at session start. |
+| `list_providers` | Table | Available cloud/SaaS providers (top of the hierarchy).  No inputs. |
+| `list_services` | Table | Services under a provider.  Requires `provider`. |
+| `list_resources` | Table | Resources under a `provider`.`service`.  Requires `provider` and `service`. |
+| `list_methods` | Table | Access methods (HTTP operations) for a resource with their SQL verb and required params.  **Call before writing any query.** Requires `provider`, `service`, `resource`. |
+| `describe_method` | KV | Full I/O contract for one method (always EXTENDED): inputs with `param_type` and the `output` fields a SELECT can reference.  Requires `provider`, `service`, `resource`, `method`. |
+| `validate_select_query` | KV | Parse and plan a SELECT without executing.  Returns `{valid, errors}`.  SELECT only. |
+| `run_select_query` | Table | Execute a SELECT.  Returns `{rows}`.  Reads only. |
+| `run_mutation_query` | KV | Execute INSERT/UPDATE/REPLACE/DELETE.  **Real side effects.** Returns `{messages, timestamp}`.  Gated by the server [mode](#server-modes). |
+| `run_lifecycle_operation` | KV | Execute a stackql `EXEC` lifecycle operation.  Returns `{messages, timestamp}`.  Gated by the server [mode](#server-modes). |
+| `list_registry` | Table | Providers (and their versions) available in the configured registry.  Optional `provider` lists versions for that provider. |
+| `pull_provider` | KV | Install a provider from the registry into the local approot cache.  Requires `provider`; `version` optional.  Local cache write only. |
+| `reload_credentials` | Table | Live-reload credentials: re-source the [`--env.file`](#credential-resourcing---envfile--reload_credentials) dotenv file into the process environment, invalidate cached auth contexts and report resolution status (with a `changed` flag) for every installed provider.  Never returns secret values.  Optional `provider` filters the report.  Recovery and rotation only, never a pre-query step.  Allowed in every mode. |
+| `query_library_search` | Table | Search the curated query library by natural-language `intent` (optional `provider` / `service` / `tags` filters).  Consult before composing SQL from scratch.  Read-only, no credentials. |
+| `query_library_get` | KV | Retrieve one library entry by `id`; with `params` the server validates them and returns rendered SQL plus the tool to execute it with.  Read-only, no credentials. |
+
+## Canonical agent prompts, resources and instructions
+
+Instructions, prompts, resources and tool descriptions are authored as markdown under `pkg/mcp_server/content/` and embedded into the binary at build time; adding or changing published content is a markdown-only edit.  Tool descriptions live one file per tool under `content/tools/`; the tool table above paraphrases them.
+
+- **Instructions**: dialect and session guidance surfaced in the `initialize` result.  Suppress with `disable_instructions: true` in the config.
+- **Prompts**: seven prompts are published - `getting_started` (interactive guided tour for new users; optional `provider` argument, falls back to credential-free `github`), `cloud_audit` (agent-driven read-only cross-cloud security and FinOps audit; the agent-driven counterpart of the dockerised audit in [docs/audit.md](/docs/audit.md)), `drift_report`, `iam_access_review`, `public_exposure_scan`, `cost_cleanup` and `create_deploy_stack` (guided generation of a [stackql-deploy](https://github.com/stackql/stackql-deploy) stack with live-tested queries).  Per-prompt detail lives in [the `pkg/mcp_server` README](/pkg/mcp_server/README.md).
+- **Resources**: reference documents served via `resources/list` / `resources/read` - currently `stackql_scope_discovery` (`stackql://docs/scope_discovery`), `stackql_server_instructions` (`stackql://docs/instructions`), `stackql_audit_rubric` (`stackql://docs/audit_rubric`) and `stackql_deploy_stack_authoring` (`stackql://docs/deploy_stack_authoring`).  Per-resource detail lives in [the `pkg/mcp_server` README](/pkg/mcp_server/README.md).
+
+`EnabledTools`, `EnabledPrompts` and `EnabledResources` on `Config` are independent allowlists.  When omitted or empty everything is published; when populated they restrict the published surface to the named items.  See [the `pkg/mcp_server` README](/pkg/mcp_server/README.md) for details.
+
+
+## Server modes
+
+`Config.Server.Mode` picks one of four safety contracts.  All four allow SELECTs and metadata reads; they differ in how they handle mutations and lifecycle operations.
+
+| Mode | SELECT / metadata | INSERT / UPDATE / REPLACE / MERGE / UPSERT | DELETE | EXEC (lifecycle) |
+|---|---|---|---|---|
+| `read_only` | allow | refuse | refuse | refuse |
+| `safe` (default) | allow | needs approval | needs approval | needs approval |
+| `delete_safe` | allow | allow | needs approval | needs approval |
+| `full_access` | allow | allow | allow | allow |
+
+**Refuse** returns an error immediately.
+
+**Needs approval** uses the MCP elicitation flow, shaped by the negotiated protocol revision (see [Protocol revision support](#protocol-revision-support)):
+
+- If the client advertised elicitation (at initialise, or in the per-request `_meta` client capabilities on 2026-07-28), the server asks the user to approve the action (tool name, query class, SQL).  On 2026-07-28 the prompt is returned as an `input_required` result carrying an `elicitation/create` input request under the id `stackql_approval`, and the client retries the call with the answer in `inputResponses` and the echoed `requestState`; on earlier revisions the server sends the `elicitation/create` request itself mid-call.  Branch on the user response: `accept` -> proceed; `decline` or `cancel` -> return an error.
+- If the client did **not** advertise elicitation, the tool is refused with a message that points the operator at `full_access` mode.  This check runs before any answer is read, on the first call and on the retry.
+
+**Approval binding.**  The approval prompt carries an opaque `requestState` that the client echoes on the retry.  It binds the answer to the prompt: it holds the tool name, a SHA-256 digest of the canonical arguments and SQL, the session id where the transport has one, a nonce and an expiry (10 minutes), and is authenticated with HMAC-SHA256 under a server key.  An answer with missing, altered or expired state, or with state that no longer matches the tool, arguments or SQL of the call, is refused before the answer is read, and the backend is not called.  On earlier revisions the SDK performs the round trip on the server side and echoes the state itself, so both lifecycles take the same check.  Each process keeps a set of used nonces, so a state is accepted once.
+
+The key is random per process by default, which suits `stdio` (one process per client, no session id) and a single HTTP instance.  A sessionless Streamable HTTP deployment (`"stateless": true` or `protocol_version: 2026-07-28`) behind several instances needs one key on every instance: set `server.approval_key_env_var` to the name of an environment variable holding at least 32 bytes, read at startup in the same way as `auth_token_env_var`.  The key never appears in logs or the audit sink.  The used-nonce set is not shared across instances, so on such a deployment a replayed answer is bounded only by the expiry.
+
+**Client trust.**  `safe` and `delete_safe` trust the MCP client to show the prompt to a person and report the answer faithfully.  The binding above rejects unsolicited, stale, altered and replayed answers from a cooperating client, but a malicious client can still accept its own prompt, so it is workflow integrity, not proof of human consent.  Against untrusted clients use server-side restrictions: `read_only` mode, or a narrowed set of enabled tools.
+
+The bundled `stackql_mcp_client` does NOT advertise elicitation, so against a `safe` or `delete_safe` server every mutation/lifecycle call is refused with the no-elicitation message.  This is by design - the bundled client exists for scripting and regression tests, not interactive use.  Elicitation-capable MCP clients (eg Claude Desktop, Cursor) prompt the user normally.
+
+## Protocol revision support
+
+The server speaks every revision the [Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk) supports and negotiates per client, so a fleet of mixed clients works against one server:
+
+| Revision | Lifecycle | Approval prompt (`safe` / `delete_safe`) |
+|---|---|---|
+| `2026-07-28` (advertised) | No handshake: `server/discover`, then every request carries `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` in `_meta` (plus the `Mcp-Protocol-Version` header on HTTP) | `input_required` result + retry with `inputResponses` (SEP-2322) |
+| `2025-11-25`, `2025-06-18` | `initialize` / `notifications/initialized` | Server-initiated `elicitation/create` request |
+| `2025-03-26`, `2024-11-05` | as above | as above |
+
+Transport behaviour:
+
+- **stdio** serves every revision on one process; a new-revision client's first request is served without a handshake and a legacy client's `initialize` still works.
+- **Streamable HTTP** defaults to the stateful, session-per-client model (`Mcp-Session-Id`), which the SDK serves for revisions up to `2025-11-25`; a `2026-07-28` request is answered with JSON-RPC error `-32022` (`UnsupportedProtocolVersion`, SDK v1.8.0; a plain HTTP 400 before) whose `data.supported` lists the handshake revisions, and `server/discover` advertises the same, so the client negotiates down and existing HTTP hosts keep their sessions and elicitation unchanged.  Set `"stateless": true` in `server` (or pin `protocol_version` to `2026-07-28`, below) to serve `2026-07-28` natively: no `Mcp-Session-Id` is issued or read, `GET` and `DELETE` answer 405 (there is no session to tear down), `tools/list` / `prompts/list` / `resources/list` are connection-invariant, and gated writes use the input-required round trip.  A sessionless server still accepts a legacy `initialize` and serves reads to that client, but cannot retain the elicitation capability a legacy client declared at initialise (the SDK gives each request an ephemeral session), so legacy HTTP clients cannot approve gated writes on it.  Pick stateless for current-revision hosts, stateful for a mixed legacy fleet.
+
+```bash
+./build/stackql mcp --mcp.server.type=http --mcp.config '{"server": {"transport": "http", "address": "127.0.0.1:9992", "allow_unauthenticated": true, "stateless": true} }'
+```
+
+The server holds no cross-call state: mode, audit and provider auth are process-level configuration, so nothing needed to move behind explicit handles (SEP-2567).  The robot suite drives stdio and both HTTP models with a 2025-06-18 handshake client and a 2026-07-28 stateless client, including the gated write on each revision.
+
+### Pinning the revision (`--mcp.protocol.version`)
+
+By default the server advertises every revision the SDK supports and negotiates per client.  To narrow that:
+
+```bash
+./build/stackql mcp --mcp.server.type=http --mcp.protocol.version=2026-07-28 --mcp.config '{"server": {"transport": "http", "address": "127.0.0.1:9992", "allow_unauthenticated": true} }'
+./build/stackql mcp --mcp.server.type=stdio --mcp.protocol.version=2025-11-25
+```
+
+The flag overrides `server.protocol_version` in `mcp.config` (`"server": {"protocol_version": "2025-11-25"}`) and sets the newest revision the server advertises (the SDK's `ServerOptions.SupportedProtocolVersions`):
+
+| Value | Advertised | Effect |
+|---|---|---|
+| `auto` (default) or absent | every SDK revision | negotiation as above: the highest revision both sides speak |
+| `2026-07-28` | `2026-07-28` only | sessionless only; implies `stateless` for Streamable HTTP.  A legacy `initialize` is answered with `2025-11-25`, the SDK's cue that the client should disconnect rather than read the answer as the new lifecycle |
+| `2025-11-25` (or any older revision) | that revision and everything before it | handshake lifecycle only: a `2026-07-28` request gets `-32022` with `data.supported` listing the advertised revisions so the client can renegotiate; older handshake clients keep their own revision |
+
+Any other value fails config validation at startup (`invalid server.protocol_version`, naming the legal values).  The robot suite covers each row on stdio and Streamable HTTP, the automatic negotiation, and the stateful downgrade error.
+
+### Transport limits and deprecated features (SDK v1.8.0)
+
+- Streamable HTTP request bodies are capped at the SDK default of 4 MiB (`413` beyond it) and JSON nested deeper than 1000 levels is rejected before parsing; stackql's own stdio transport bounds a frame at 8 MiB (issue #701).  None of these are configurable in `mcp.config`: they sit far above any SQL statement stackql accepts.
+- Roots, sampling and server-side logging are deprecated by `2026-07-28` (SEP-2577).  stackql uses none of them: it issues no roots or sampling requests and emits no `notifications/message`; the SDK's default `logging` capability stays advertised for the deprecation window.
+
+### Breaking change vs PR1
+
+PR1 had a single `read_only: true/false` flag with a default of "no enforcement; mutations proceed."  PR2 replaces that flag with `mode: safe` as the default, which means **mutations now require user approval out of the box.**  Operators running an elicitation-capable client see one approval prompt per mutation.  Operators running automation or the bundled client must explicitly opt into `full_access`.
+
+The legacy `read_only: true` JSON / YAML key still parses for back-compat and is treated as equivalent to `mode: read_only`.  `mode` wins when both are set.
+
+
+## Audit log
+
+Every tool call writes one JSONL record.  The audit answers "what did the agent do," not "what did the agent see" - result rows from SELECTs are intentionally not recorded.
+
+Recorded per event:
+
+| Field | Notes |
+|---|---|
+| `timestamp` | RFC3339 start-of-call wall clock |
+| `tool` | Tool name (eg `run_select_query`) |
+| `mode` | Server mode in effect at call time |
+| `decision` | `allow` / `refuse_immediate` / `needs_approval_accepted` / `needs_approval_declined` / `needs_approval_cancelled` / `needs_approval_unavailable` |
+| `query_class` | `select` / `mutation_create` / `mutation_delete` / `lifecycle` / `unknown` |
+| `sql` | For query tools (`run_select_query`, `run_mutation_query`, `run_lifecycle_operation`, `validate_select_query`) |
+| `args` | Hierarchy fields for metadata tools (`list_*`, `describe_method`); SQL + row_limit for query tools |
+| `duration_ms` | Wall-clock duration of the gate + handler |
+| `error` | Error message if the tool errored or was refused |
+
+### File sink
+
+The only sink shipped in this release is `file`.  One JSON object per line, fsynced after each record.  Lumberjack-style rotation.
+
+```bash
+./build/stackql mcp \
+  --mcp.server.type=http \
+  --mcp.config '{"server": {"transport": "http", "address": "127.0.0.1:9992", "allow_unauthenticated": true, "audit": {"file": {"path": "/var/log/stackql-mcp.log", "max_size_mb": 100, "max_backups": 5, "max_age_days": 30}}} }'
+```
+
+Two ways to specify the location:
+
+- `audit.file.path` -- a complete file path (absolute, or relative to cwd).
+- `audit.file.dir` -- a directory; the sink chooses the basename (`stackql_mcp_server_<RFC3339-utc-second>.log`) inside it.
+
+When neither is set in `mcp.config`, the MCP server defaults `dir` to cwd so existing operators see PR2 behaviour.  The underlying [generic `pkg/sink`](/pkg/sink) package itself refuses to silently pick a directory -- the "where do logs land" decision is always made by the caller (here, the MCP server's `initAuditSink`).
+
+The resolved absolute path is logged to stderr at startup as `sink file: /path/to/file.log`.
+
+### Failure modes
+
+When the sink returns an error, the response behaviour depends on `failure_mode`:
+
+| failure_mode | Effect |
+|---|---|
+| `strict` (default) | The tool call returns the audit error to the client, even if the underlying tool succeeded.  Intentional: better an ambiguous client than an undetected DELETE. |
+| `strict_mutations` | SELECT / metadata reads proceed; mutations and lifecycle ops surface the audit error. |
+| `best_effort` | Always log to stderr and proceed. |
+
+### Sequencing
+
+The audit write happens AFTER the tool executes (or is skipped because it was gated out) but BEFORE the response returns to the client.  In strict mode an audit-write failure on a successful DELETE means the row is gone but the client sees an error - by design.
+
+### Log format (`--mcp.log.format`)
+
+The audit stream has two encodings, written to the same file sink:
+
+```bash
+./build/stackql mcp --mcp.server.type=stdio --mcp.log.format=jsonl   # default, unchanged
+./build/stackql mcp --mcp.server.type=stdio --mcp.log.format=otel    # OTLP/JSON log records
+```
+
+The flag overrides `server.audit.format` in `mcp.config` (`"audit": {"format": "otel"}`).  `jsonl` is byte-compatible with the records described above.  `otel` wraps the same sink with the generic OTLP/JSON decorator from [`pkg/sink`](/pkg/sink) (usable by any subsystem that writes records; the MCP-specific part is only the attribute mapping in `pkg/mcp_server/audit`) and writes one OTLP/JSON `LogsData` object per line, the shape the OpenTelemetry Collector's `otlp_json_file` receiver ingests as-is (verified against otelcol-contrib 0.160.0), so the stream reaches any OTLP pipeline with no transform processor:
+
+```yaml
+receivers:
+  otlp_json_file:
+    include: [/var/log/stackql-mcp.log]
+exporters:
+  debug: {}
+service:
+  pipelines:
+    logs:
+      receivers: [otlp_json_file]
+      exporters: [debug]
+```
+
+Each tool call produces one log record; a call that went through the approval gate produces a second record for the elicitation decision.  Records of one call share `gen_ai.tool.call.id` and a trace id; a W3C `traceparent` supplied by the caller in `params._meta` is honoured, otherwise one trace id is generated per MCP session so an agent session's records correlate.
+
+The emitted attribute set is a versioned interface: the instrumentation scope is `github.com/stackql/stackql/pkg/mcp_server/audit` at version `1.0.0`, and `schemaUrl` pins the stable conventions to `https://opentelemetry.io/schemas/1.44.0`.  The `gen_ai.*` and `mcp.*` attributes follow the [GenAI](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md#execute-tool-span) and [MCP](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/mcp.md) semantic conventions, which are Development status; a unit test asserts the exact set below and the scope version is bumped when it changes.
+
+| Attribute | Record | Value |
+|---|---|---|
+| `service.name`, `service.version` | resource | `stackql`, the stackql version |
+| `gen_ai.operation.name` | tool call | `execute_tool` |
+| `mcp.method.name` | both | `tools/call` on the tool call record, `elicitation/create` on the decision record |
+| `gen_ai.tool.name` | both | tool name |
+| `gen_ai.tool.call.id` | both | generated per call, shared by both records |
+| `mcp.protocol.version` | both | negotiated revision |
+| `mcp.session.id` | both | session id (absent for stateless HTTP requests) |
+| `stackql.mode` | both | server mode |
+| `stackql.decision` | both | the `decision` value from the JSONL table |
+| `stackql.query` | tool call | verbatim SQL, for query tools |
+| `stackql.query_class` | tool call | the `query_class` value |
+| `stackql.provider` | tool call | provider, for metadata tools |
+| `stackql.query.source` | tool call | query library entry id, when supplied |
+| `stackql.duration_ms` | tool call | wall-clock duration |
+| `stackql.rows_returned` | tool call | row count, for row-returning tools |
+| `error.type`, `error.message` | tool call | on failure: the refusing decision, or `tool_error` past the gate |
+
+Body is `execute_tool <tool>` / `elicitation <tool>`; severity is `INFO`, or `ERROR` when the call failed or was refused.  The redaction contract is identical in both formats: result values are never serialised, only the statement that produced them.
+
+### Breaking change vs PR1
+
+PR1 had no audit subsystem; PR2 enables audit by default.  To preserve PR1 behaviour, pass `"audit": {"disabled": true}` in `mcp.config`.
+
+
+## Example responses
+
+Responses below show the typed structured payload (what `--exec` prints as JSON).  The MCP `Content` block also carries a rendered text view (markdown table or KV) that the LLM consumes; it is not shown here.
+
+```bash
+
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action server_info 2>/dev/null | jq
+{
+  "version": "0.10.444",
+  "commit": "abc1234",
+  "build_date": "2026-05-16T10:47:33Z",
+  "platform": "linux/amd64",
+  "transport": "http",
+  "sql_backend": "sqlite3",
+  "provider_registry": "https://registry.stackql.app",
+  "mode": "safe",
+  "is_read_only": false
+}
+
+
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action list_providers 2>/dev/null | jq
+{
+  "rows": [
+    { "name": "aws",         "version": "v24.07.00246" },
+    { "name": "azure",       "version": "v24.06.00242" },
+    { "name": "google",      "version": "v25.11.00355" },
+    { "name": "github",      "version": "v25.07.00320" }
+  ]
+}
+
+
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action list_services --exec.args '{"provider": "google"}' 2>/dev/null | jq
+{
+  "rows": [
+    { "id": "compute:v25.11.00355",     "name": "compute",     "title": "Compute Engine API" },
+    { "id": "storage:v25.11.00355",     "name": "storage",     "title": "Cloud Storage API" }
+  ]
+}
+
+
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action list_resources --exec.args '{"provider": "google", "service": "compute"}' 2>/dev/null | jq
+{
+  "rows": [
+    { "name": "instances" },
+    { "name": "networks" },
+    { "name": "subnetworks" }
+  ]
+}
+
+
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action list_methods --exec.args '{"provider": "google", "service": "compute", "resource": "networks"}' 2>/dev/null | jq
+{
+  "rows": [
+    { "MethodName": "get",      "RequiredParams": "network, project",  "SQLVerb": "SELECT" },
+    { "MethodName": "list",     "RequiredParams": "project",            "SQLVerb": "SELECT" },
+    { "MethodName": "insert",   "RequiredParams": "project",            "SQLVerb": "INSERT" },
+    { "MethodName": "delete",   "RequiredParams": "network, project",  "SQLVerb": "DELETE" }
+  ]
+}
+
+
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action describe_method --exec.args '{"provider": "google", "service": "compute", "resource": "networks", "method": "get"}' 2>/dev/null | jq
+{
+  "rows": [
+    { "name": "project", "type": "string", "param_type": "input_required", "shape": "string",  "description": "Project ID for this request." },
+    { "name": "network", "type": "string", "param_type": "input_required", "shape": "string",  "description": "Name of the network to return." },
+    { "name": "id",      "type": "string", "param_type": "output",         "shape": "string",  "description": "[Output Only] The unique identifier..." }
+  ]
+}
+
+
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action validate_select_query --exec.args '{"sql": "select name from google.compute.networks where project = '"'"'stackql-demo'"'"';"}' 2>/dev/null | jq
+{
+  "valid": true
+}
+
+
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action run_select_query --exec.args '{"sql": "select name from google.compute.networks where project = '"'"'stackql-demo'"'"';"}' 2>/dev/null | jq
+{
+  "rows": [
+    { "name": "pathfinders-test-01" },
+    { "name": "pathfinders-test-02" },
+    { "name": "returning-test-01" },
+    { "name": "returning-test-03" }
+  ]
+}
+
+
+## Mutations and lifecycle operations have real side effects.  Their behaviour
+## depends on the server [mode](#server-modes):
+##   - read_only         -> refused immediately
+##   - safe              -> elicits user approval; refused if the client does
+##                          not advertise elicitation (the bundled client does
+##                          NOT, so this returns an error)
+##   - delete_safe       -> mutation_create proceeds; DELETE / EXEC elicit
+##   - full_access       -> proceeds without prompting
+##
+## Example below assumes a full_access server.  Response shape is
+## {messages, timestamp}.
+$ ./build/stackql_mcp_client exec --client-type=http  --url=http://127.0.0.1:9992 --exec.action run_mutation_query --exec.args '{"sql": "delete from google.compute.networks where project = '"'"'stackql-demo'"'"' and network = '"'"'returning-test-01'"'"' ;"}' 2>/dev/null | jq
+{
+  "messages": [
+    "The operation was despatched successfully"
+  ],
+  "timestamp": "2026-05-16T10:47:33+10:00 AEST"
+}
+
+
+## Example audit log line (`mcp-audit.log`) for the call above.
+{"timestamp":"2026-05-16T00:47:33Z","tool":"run_mutation_query","mode":"full_access","decision":"allow","query_class":"mutation_delete","sql":"delete from google.compute.networks where project = 'stackql-demo' and network = 'returning-test-01' ;","args":{"sql":"delete from google.compute.networks where project = 'stackql-demo' and network = 'returning-test-01' ;","row_limit":0},"duration_ms":42}
+
+```

@@ -1,0 +1,216 @@
+
+ARG RUNTIME_IMAGE=ubuntu:26.04
+
+FROM golang:1.27.3-bookworm AS sourceprep
+
+ENV SRC_DIR=/work/stackql/src
+
+ENV BUILD_DIR=/work/stackql/build
+
+RUN mkdir -p ${SRC_DIR} ${BUILD_DIR}
+
+ADD internal  ${SRC_DIR}/internal
+
+ADD pkg ${SRC_DIR}/pkg
+
+ADD stackql ${SRC_DIR}/stackql
+
+ADD mcp_client ${SRC_DIR}/mcp_client
+
+ADD cicd/go ${SRC_DIR}/cicd/go
+
+ADD test ${SRC_DIR}/test
+
+COPY go.mod go.sum ${SRC_DIR}/
+
+RUN  cd ${SRC_DIR} && ls && go get -v -t -d ./...
+
+FROM sourceprep AS builder 
+
+ARG BUILDMAJORVERSION="1"
+ARG BUILDMINORVERSION="1"
+ARG BUILDPATCHVERSION="1"
+ARG BUILDPRERELEASESUFFIX=""
+ARG BUILDCOMMITSHA="1"
+ARG BUILDSHORTCOMMITSHA="1"
+ARG BUILDDATE="1"
+ARG PLANCACHEENABLED="false"
+ARG BUILDPLATFORM="1"
+ARG RUN_INTEGRATION_TESTS="1"
+
+ENV BUILDMAJORVERSION=${BUILDMAJORVERSION}
+ENV BUILDMINORVERSION=${BUILDMINORVERSION}
+ENV BUILDPATCHVERSION=${BUILDPATCHVERSION}
+ENV BUILDPRERELEASESUFFIX=${BUILDPRERELEASESUFFIX}
+ENV BUILDCOMMITSHA=${BUILDCOMMITSHA}
+ENV BUILDSHORTCOMMITSHA=${BUILDSHORTCOMMITSHA}
+ENV BUILDDATE=${BUILDDATE}
+ENV PLANCACHEENABLED=${PLANCACHEENABLED}
+ENV BUILDPLATFORM=${BUILDPLATFORM}
+
+ENV SRC_DIR=/work/stackql/src
+
+ENV BUILD_DIR=/work/stackql/build
+
+RUN   cd ${SRC_DIR} \
+      && CGO_ENABLED=0 go generate ./internal/stackql/dependencies \
+      && CGO_ENABLED=0 go test ./... \
+      && CGO_ENABLED=0 go build -ldflags "-X github.com/stackql/stackql/internal/stackql/cmd.BuildMajorVersion=$BUILDMAJORVERSION \
+          -X github.com/stackql/stackql/internal/stackql/cmd.BuildMinorVersion=$BUILDMINORVERSION \
+          -X github.com/stackql/stackql/internal/stackql/cmd.BuildPatchVersion=$BUILDPATCHVERSION \
+          -X github.com/stackql/stackql/internal/stackql/cmd.BuildPreReleaseSuffix=$BUILDPRERELEASESUFFIX \
+          -X github.com/stackql/stackql/internal/stackql/cmd.BuildCommitSHA=$BUILDCOMMITSHA \
+          -X github.com/stackql/stackql/internal/stackql/cmd.BuildShortCommitSHA=$BUILDSHORTCOMMITSHA \
+          -X \"github.com/stackql/stackql/internal/stackql/cmd.BuildDate=$BUILDDATE\" \
+          -X \"stackql/internal/stackql/planbuilder.PlanCacheEnabled=$PLANCACHEENABLED\" \
+          -X github.com/stackql/stackql/internal/stackql/cmd.BuildPlatform=$BUILDPLATFORM" \
+        -o ${BUILD_DIR}/stackql ./stackql
+
+RUN   cd ${SRC_DIR} \
+      && CGO_ENABLED=0 go build \
+        -o ${BUILD_DIR}/stackql_mcp_client ./mcp_client/cmd
+
+# bookworm, not bullseye: bullseye LTS ended 2026-08-31 and its security suite
+# is being withdrawn from the mirrors (expired Release file, packages vanishing
+# from the pool), which broke apt-get in this stage on arm64 first.
+FROM python:3.11-bookworm AS utility
+
+ARG TEST_ROOT_DIR=/opt/test/stackql
+
+ARG RUN_INTEGRATION_TESTS
+
+ENV TEST_ROOT_DIR=${TEST_ROOT_DIR}
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+      openssl \
+      postgresql-client \
+      sqlite3
+
+FROM utility AS certificates
+
+ARG TEST_ROOT_DIR=/opt/test/stackql
+
+ARG RUN_INTEGRATION_TESTS
+
+ENV TEST_ROOT_DIR=${TEST_ROOT_DIR}
+
+RUN mkdir -p ${TEST_ROOT_DIR}
+
+ADD test ${TEST_ROOT_DIR}/test
+
+RUN openssl req -x509 -keyout ${TEST_ROOT_DIR}/test/server/mtls/credentials/pg_server_key.pem -out  ${TEST_ROOT_DIR}/test/server/mtls/credentials/pg_server_cert.pem  -config ${TEST_ROOT_DIR}/test/server/mtls/openssl.cnf -days 365 \
+    && openssl req -x509 -keyout ${TEST_ROOT_DIR}/test/server/mtls/credentials/pg_client_key.pem -out  ${TEST_ROOT_DIR}/test/server/mtls/credentials/pg_client_cert.pem  -config ${TEST_ROOT_DIR}/test/server/mtls/openssl.cnf -days 365 \
+    && openssl req -x509 -keyout ${TEST_ROOT_DIR}/test/server/mtls/credentials/pg_rubbish_key.pem -out ${TEST_ROOT_DIR}/test/server/mtls/credentials/pg_rubbish_cert.pem -config ${TEST_ROOT_DIR}/test/server/mtls/openssl.cnf -days 365
+
+FROM python:3.11-bookworm AS registrymock
+
+ARG TEST_ROOT_DIR=/opt/test/stackql
+
+ARG RUN_INTEGRATION_TESTS
+
+ENV TEST_ROOT_DIR=${TEST_ROOT_DIR}
+
+RUN mkdir -p ${TEST_ROOT_DIR}
+
+ADD cicd ${TEST_ROOT_DIR}/cicd
+
+COPY --from=certificates /opt/test/stackql ${TEST_ROOT_DIR}/
+
+RUN pip3 install PyYaml \
+    && python3 ${TEST_ROOT_DIR}/test/python/stackql_test_tooling/registry_rewrite.py \
+      --srcdir ${TEST_ROOT_DIR}/test/registry/src --destdir ${TEST_ROOT_DIR}/test/registry-mocked/src
+
+FROM utility AS integration
+
+ARG TEST_ROOT_DIR=/opt/test/stackql
+
+ENV TEST_ROOT_DIR=${TEST_ROOT_DIR}
+
+ARG BUILDMAJORVERSION="1"
+ARG BUILDMINORVERSION="1"
+ARG BUILDPATCHVERSION="1"
+ARG BUILDPRERELEASESUFFIX=""
+ARG BUILDCOMMITSHA="1"
+ARG BUILDSHORTCOMMITSHA="1"
+ARG BUILDDATE="1"
+ARG PLANCACHEENABLED="false"
+ARG BUILDPLATFORM="1"
+ARG RUN_INTEGRATION_TESTS
+
+ENV BUILDMAJORVERSION=${BUILDMAJORVERSION}
+ENV BUILDMINORVERSION=${BUILDMINORVERSION}
+ENV BUILDPATCHVERSION=${BUILDPATCHVERSION}
+ENV BUILDPRERELEASESUFFIX=${BUILDPRERELEASESUFFIX}
+ENV BUILDCOMMITSHA=${BUILDCOMMITSHA}
+ENV BUILDSHORTCOMMITSHA=${BUILDSHORTCOMMITSHA}
+ENV BUILDDATE=${BUILDDATE}
+ENV PLANCACHEENABLED=${PLANCACHEENABLED}
+ENV BUILDPLATFORM=${BUILDPLATFORM}
+
+RUN mkdir -p ${TEST_ROOT_DIR}/build
+
+COPY --from=registrymock /opt/test/stackql ${TEST_ROOT_DIR}/
+
+COPY --from=builder /work/stackql/build/stackql ${TEST_ROOT_DIR}/build/
+
+COPY --from=builder /work/stackql/build/stackql_mcp_client ${TEST_ROOT_DIR}/build/
+
+RUN  if [ "${RUN_INTEGRATION_TESTS}" = "1" ]; then env PYTHONPATH="$PYTHONPATH:${TEST_ROOT_DIR}/test/python" robot ${TEST_ROOT_DIR}/test/robot/functional; fi
+
+FROM ${RUNTIME_IMAGE} AS app
+
+ARG TEST_ROOT_DIR=/opt/test/stackql
+
+ENV TEST_ROOT_DIR=${TEST_ROOT_DIR}
+
+ARG APP_DIR=/srv/stackql
+
+ARG STACKQL_CFG_ROOT=/opt/stackql
+
+ARG STACKQL_PG_PORT=5477
+
+# Runtime identity for the production stage (issue #833).  Override at build
+# time to match a host user when bind-mounting writable volumes, or at run
+# time with `docker run --user` / compose `user:`.
+ARG STACKQL_UID=1000
+
+ARG STACKQL_GID=1000
+
+ENV APP_DIR="${APP_DIR}"
+
+ENV STACKQL_CFG_ROOT="${STACKQL_CFG_ROOT}"
+
+ENV STACKQL_PG_PORT="${STACKQL_PG_PORT}"
+
+RUN if getent group "${STACKQL_GID}" >/dev/null; then \
+        groupmod --new-name stackql "$(getent group "${STACKQL_GID}" | cut -d: -f1)"; \
+    else groupadd --gid "${STACKQL_GID}" stackql; fi \
+    && if getent passwd "${STACKQL_UID}" >/dev/null; then \
+        usermod --login stackql --gid "${STACKQL_GID}" --home "${STACKQL_CFG_ROOT}" --shell /bin/bash "$(getent passwd "${STACKQL_UID}" | cut -d: -f1)"; \
+    else useradd --uid "${STACKQL_UID}" --gid "${STACKQL_GID}" --home-dir "${STACKQL_CFG_ROOT}" --no-create-home --shell /bin/bash stackql; fi \
+    && mkdir -p ${APP_DIR} ${STACKQL_CFG_ROOT}/keys ${STACKQL_CFG_ROOT}/srv/credentials ${STACKQL_CFG_ROOT}/credentials/dummy ${STACKQL_CFG_ROOT}/registry ${STACKQL_CFG_ROOT}/logs ${STACKQL_CFG_ROOT}/db \
+    && chown -R ${STACKQL_UID}:${STACKQL_GID} ${STACKQL_CFG_ROOT}
+
+ENV PATH="${APP_DIR}:${PATH}"
+
+COPY --from=integration ${TEST_ROOT_DIR}/build/stackql ${APP_DIR}/
+
+COPY --from=integration ${TEST_ROOT_DIR}/build/stackql_mcp_client ${APP_DIR}/
+
+RUN apt-get update \
+    && apt-get install -y ca-certificates openssl netcat-traditional jq dnsutils \
+    && update-ca-certificates
+
+EXPOSE ${STACKQL_PG_PORT}/tcp
+
+RUN --mount=type=bind,source=cicd/docker/py-img-requirements.txt,target=/tmp/py-img-requirements.txt \
+    if command -v python3 >/dev/null 2>&1; then \
+        python3 -m pip install --no-cache-dir -r /tmp/py-img-requirements.txt; \
+    fi
+
+USER ${STACKQL_UID}:${STACKQL_GID}
+
+WORKDIR ${STACKQL_CFG_ROOT}
+
+CMD ["/bin/bash", "-c", "stackql --pgsrv.port=${STACKQL_PG_PORT} srv"]

@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+
+
+import argparse
+import json
+import os
+import subprocess
+
+_DEFAULT_PLANCACHEENABLED = 'false'
+
+
+def generate_dependency_inventory() -> int:
+    go_env = json.loads(subprocess.check_output(
+        ['go', 'env', '-json', 'GOOS', 'GOARCH', 'GOHOSTOS', 'GOHOSTARCH'],
+        text=True,
+    ))
+    generator_env = os.environ.copy()
+    generator_env['GOOS'] = go_env['GOHOSTOS']
+    generator_env['GOARCH'] = go_env['GOHOSTARCH']
+    return subprocess.call(
+        ['go', 'run', './cicd/go/dependency-metadata', '-targets',
+         f"{go_env['GOOS']}/{go_env['GOARCH']}"],
+        env=generator_env,
+    )
+
+
+def build_stackql(verbose :bool) -> int:
+    os.environ['BUILDMAJORVERSION'] = os.environ.get('BUILDMAJORVERSION', '1')
+    os.environ['BUILDMINORVERSION'] = os.environ.get('BUILDMINORVERSION', '1')
+    os.environ['BUILDPATCHVERSION'] = os.environ.get('BUILDPATCHVERSION', '1')
+    os.environ['CGO_ENABLED'] = os.environ.get('CGO_ENABLED', '0')
+    metadata_status = generate_dependency_inventory()
+    if metadata_status != 0:
+        return metadata_status
+    return subprocess.call(
+        f'go build {"-x -v" if verbose else ""} -ldflags "-X github.com/stackql/stackql/internal/stackql/cmd.BuildMajorVersion={os.environ.get("BUILDMAJORVERSION")} '
+        f'-X github.com/stackql/stackql/internal/stackql/cmd.BuildMinorVersion={os.environ.get("BUILDMINORVERSION")} '
+        f'-X github.com/stackql/stackql/internal/stackql/cmd.BuildPatchVersion={os.environ.get("BUILDPATCHVERSION")} '
+        f'-X github.com/stackql/stackql/internal/stackql/cmd.BuildPreReleaseSuffix={os.environ.get("BUILDPRERELEASESUFFIX", "")} '
+        f'-X github.com/stackql/stackql/internal/stackql/cmd.BuildCommitSHA={os.environ.get("BUILDCOMMITSHA", "")} '
+        f'-X github.com/stackql/stackql/internal/stackql/cmd.BuildShortCommitSHA={os.environ.get("BUILDCOMMITSHA", "")[0:7 or None]} '
+        f"-X 'github.com/stackql/stackql/internal/stackql/cmd.BuildDate={os.environ.get('BUILDDATE', '')}' "
+        f"-X 'stackql/internal/stackql/planbuilder.PlanCacheEnabled={os.environ.get('PLANCACHEENABLED', _DEFAULT_PLANCACHEENABLED)}' "
+        f'-X github.com/stackql/stackql/internal/stackql/cmd.BuildPlatform={os.environ.get("BUILDPLATFORM", "")}" '
+        '-o build/ ./stackql',
+        shell=True
+    )
+
+def build_stackql_mcp_client(verbose :bool) -> int:
+    os.environ['BUILDMAJORVERSION'] = os.environ.get('BUILDMAJORVERSION', '1')
+    os.environ['BUILDMINORVERSION'] = os.environ.get('BUILDMINORVERSION', '1')
+    os.environ['BUILDPATCHVERSION'] = os.environ.get('BUILDPATCHVERSION', '1')
+    os.environ['CGO_ENABLED'] = os.environ.get('CGO_ENABLED', '0')
+    return subprocess.call(
+        'go build '
+        f'{"-x -v" if verbose else ""} '
+        '-o build/stackql_mcp_client ./mcp_client/cmd',
+        shell=True
+    )
+
+
+def unit_test_stackql(verbose :bool) -> int:
+    return subprocess.call(
+        f'go test -timeout 1200s {"-v" if verbose else ""} ./...',
+        shell=True
+    )
+
+def sanitise_val(val) -> str:
+    if isinstance(val, bool):
+        return str(val).lower()
+    return str(val)
+
+
+def run_robot_mocked_functional_tests_stackql(*args, **kwargs) -> int:
+    variables = ' '.join([f'--variable {key}:{sanitise_val(value)} ' for key, value in kwargs.get("variables", {}).items() ])
+    shard_index = kwargs.get('shard_index')
+    shard_count = kwargs.get('shard_count')
+    if (shard_index is None) != (shard_count is None):
+        raise ValueError('robot shard index and count must be specified together')
+    shard_option = ''
+    if shard_index is not None:
+        if shard_count < 1 or shard_index < 1 or shard_index > shard_count:
+            raise ValueError('robot shard index must be between 1 and the shard count')
+        shard_option = (
+            '--prerunmodifier '
+            f'stackql_test_tooling.robot_shard.ShardByTest:{shard_index}:{shard_count} '
+        )
+    return subprocess.call(
+        'robot '
+        f'{variables} '
+        f'{shard_option}'
+        '-d test/robot/reports '
+        'test/robot/functional',
+        shell=True
+    )
+
+def run_robot_integration_tests_stackql(*args, **kwargs) -> int:
+    variables = ' '.join([f'--variable {key}:{sanitise_val(value)} ' for key, value in kwargs.get("variables", {}).items()])
+    return subprocess.call(
+        'robot '
+        f'{variables} ' 
+        '-d test/robot/reports-integration '
+        'test/robot/integration',
+        shell=True
+    )
+
+def run_robot_integration_traffic_lights_tests_stackql(*args, **kwargs) -> int:
+    variables = ' '.join([f'--variable {key}:{sanitise_val(value)} ' for key, value in kwargs.get("variables", {}).items()])
+    return subprocess.call(
+        'robot '
+        f'{variables} ' 
+        '-d test/robot/reports-integration-traffic-lights '
+        'test/robot/integration-traffic-lights',
+        shell=True
+    )
+
+def run_robot_foreign_integration_traffic_lights_tests_stackql(*args, **kwargs) -> int:
+    variables = ' '.join([f'--variable {key}:{sanitise_val(value)} ' for key, value in kwargs.get("variables", {}).items()])
+    return subprocess.call(
+        'robot '
+        f'{variables} ' 
+        '-d test/robot/reports-foreign-integration-traffic-lights '
+        'test/robot/foreign-integration-traffic-lights',
+        shell=True
+    )
+
+def run_robot_id_fed_integration_traffic_lights_tests_stackql(*args, **kwargs) -> int:
+    variables = ' '.join([f'--variable {key}:{sanitise_val(value)} ' for key, value in kwargs.get("variables", {}).items()])
+    return subprocess.call(
+        'robot '
+        f'{variables} ' 
+        '-d test/robot/reports-id-fed-traffic-lights '
+        'test/robot/id-fed-traffic-lights',
+        shell=True
+    )
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--build', action='store_true')
+    parser.add_argument('--build-mcp-client', action='store_true')
+    parser.add_argument('--test', action='store_true')
+    parser.add_argument('--robot-test', action='store_true')
+    parser.add_argument('--robot-shard-index', type=int)
+    parser.add_argument('--robot-shard-count', type=int)
+    parser.add_argument('--robot-test-integration', action='store_true')
+    parser.add_argument('--robot-test-traffic-lights-integration', action='store_true')
+    parser.add_argument('--robot-test-id-fed-traffic-lights-integration', action='store_true')
+    parser.add_argument('--robot-test-foreign-traffic-lights-integration', action='store_true')
+    parser.add_argument('--config', type=json.loads, default={})
+    args = parser.parse_args()
+    ret_code = 0
+    if args.build:
+        ret_code = build_stackql(args.verbose)
+        if ret_code != 0:
+            exit(ret_code)
+    if args.build_mcp_client:
+        ret_code = build_stackql_mcp_client(args.verbose)
+        if ret_code != 0:
+            exit(ret_code)
+    if args.test:
+        ret_code = unit_test_stackql(args.verbose)
+        if ret_code != 0:
+            exit(ret_code)
+    if args.robot_test:
+        ret_code = run_robot_mocked_functional_tests_stackql(
+            shard_index=args.robot_shard_index,
+            shard_count=args.robot_shard_count,
+            **args.config
+        )
+        if ret_code != 0:
+            exit(ret_code)
+    if args.robot_test_integration:
+        ret_code = run_robot_integration_tests_stackql(**args.config)
+        if ret_code != 0:
+            exit(ret_code)
+    if args.robot_test_traffic_lights_integration:
+        ret_code = run_robot_integration_traffic_lights_tests_stackql(**args.config)
+        if ret_code != 0:
+            exit(ret_code)
+    if args.robot_test_foreign_traffic_lights_integration:
+        ret_code = run_robot_foreign_integration_traffic_lights_tests_stackql(**args.config)
+        if ret_code != 0:
+            exit(ret_code)
+    if args.robot_test_id_fed_traffic_lights_integration:
+        ret_code = run_robot_id_fed_integration_traffic_lights_tests_stackql(**args.config)
+        if ret_code != 0:
+            exit(ret_code)
+    exit(ret_code)
+
+
+if __name__ == '__main__':
+    main()
